@@ -1,0 +1,5 @@
+node_modules
+out
+public/audio/*.mp3
+public/props.json
+job.json

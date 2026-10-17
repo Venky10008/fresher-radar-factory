@@ -1,0 +1,21 @@
+{
+  "name": "fresher-radar-factory",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Renders Fresher Radar reels from a JSON job (GitHub Actions)",
+  "scripts": {
+    "studio": "remotion studio src/index.ts",
+    "render": "remotion render src/index.ts RadarReel out/reel.mp4 --props=public/props.json"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.536",
+    "@remotion/google-fonts": "4.0.536",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "remotion": "4.0.536"
+  },
+  "devDependencies": {
+    "@types/react": "18.3.12",
+    "typescript": "5.6.3"
+  }
+}
