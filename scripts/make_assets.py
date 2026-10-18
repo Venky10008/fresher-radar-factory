@@ -442,6 +442,26 @@ def synth_phrases(tts_text, voice, rate):
     }
 
 
+def check_clipping(path):
+    """Run ffmpeg volumedetect on path; return max_volume in dB (or None)."""
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-i", path, "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True, text=True, check=True,
+        )
+        # volumedetect prints to stderr
+        text = out.stderr
+        for line in text.splitlines():
+            if "max_volume:" in line:
+                # line like:  [Parsed_volumedetect_0 @ ...] max_volume: -2.3 dB
+                parts = line.split("max_volume:")[1].strip()
+                val = parts.split()[0]
+                return float(val)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def silence_path(gap):
     path = os.path.join(tempfile.gettempdir(), f"gap_{gap:.2f}.mp3")
     if not os.path.exists(path):
@@ -743,10 +763,16 @@ def main():
                 log(f"scene {i}: finalizing the clip failed")
                 voiced = None
                 break
+            # clipping check
+            max_vol = check_clipping(full)
+            clip_status = "OK" if max_vol is not None and max_vol < 0 else (
+                "CLIPPING!" if max_vol is not None else "unknown"
+            )
             n_words = len(res["words"]) if res["words"] else 0
             log(
                 f"scene {i}: {res['seconds']:.2f}s engine={s['engine']} "
-                f"cps={s['cps']:.1f} atempo={atempo:.3f} word_timings={n_words}"
+                f"cps={s['cps']:.1f} atempo={atempo:.3f} word_timings={n_words} "
+                f"max_volume={max_vol:.1f} dB ({clip_status})"
             )
             voiced.append((rel, res["seconds"], res["words"]))
         if voiced is None:
@@ -762,7 +788,14 @@ def main():
 
     # ----- pictures -----
     log("== Pictures ==")
-    prompts = [p for p in (job.get("image_prompts") or []) if str(p).strip()]
+    image_prompts = job.get("image_prompts")
+    if isinstance(image_prompts, str):
+        # image_prompts may arrive as a JSON STRING of an array
+        try:
+            image_prompts = json.loads(image_prompts)
+        except json.JSONDecodeError:
+            image_prompts = []
+    prompts = [p for p in (image_prompts or []) if str(p).strip()]
     if not prompts:
         prompts = list(cat["images"])
         log("no image_prompts in the job, using generic prompts for this category")
