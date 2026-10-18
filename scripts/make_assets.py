@@ -15,13 +15,14 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
 
 FPS = 30
 VOICE_DEFAULT = "te-IN-ShrutiNeural"  # other Telugu voice: te-IN-MohanNeural
-RATE_DEFAULT = "+6%"
+RATE_DEFAULT = "+0%"  # normal speed keeps the Telugu speech clear
 FONT_MODE = os.environ.get("FONT_MODE", "web")
 TTS_ORDER = [e.strip() for e in os.environ.get("TTS_ORDER", "edge,gtts").split(",") if e.strip()]
 
@@ -151,6 +152,136 @@ def audio_seconds(path):
     return float(out.stdout.strip())
 
 
+# English words written inside Telugu text are read badly by the Telugu voice
+# ("notes" comes out as "no..ts"), so common ones are replaced with a Telugu
+# spelling before the voice reads them. On-screen text is NOT changed by this.
+TELUGU_WORDS = {
+    "notebooklm": "నోట్‌బుక్ ఎల్ఎమ్",
+    "notebook": "నోట్‌బుక్",
+    "notes": "నోట్స్",
+    "note": "నోట్",
+    "podcasts": "పాడ్‌కాస్ట్‌లు",
+    "podcast": "పాడ్‌కాస్ట్",
+    "summary": "సమరీ",
+    "quiz": "క్విజ్",
+    "quizzes": "క్విజెస్",
+    "audio": "ఆడియో",
+    "overviews": "ఓవర్‌వ్యూస్",
+    "overview": "ఓవర్‌వ్యూ",
+    "pdfs": "పీడీఎఫ్‌స్",
+    "pdf": "పీడీఎఫ్",
+    "ai": "ఏఐ",
+    "api": "ఏపీఐ",
+    "apps": "యాప్స్",
+    "app": "యాప్",
+    "exams": "ఎగ్జామ్స్",
+    "exam": "ఎగ్జామ్",
+    "revisions": "రివిజన్లు",
+    "revision": "రివిజన్",
+    "revise": "రివైజ్",
+    "fast": "ఫాస్ట్",
+    "long": "లాంగ్",
+    "jobs": "జాబ్స్",
+    "job": "జాబ్",
+    "free": "ఫ్రీ",
+    "groups": "గ్రూప్‌లు",
+    "group": "గ్రూప్",
+    "join": "జాయిన్",
+    "updates": "అప్‌డేట్స్",
+    "update": "అప్‌డేట్",
+    "bio": "బయో",
+    "tools": "టూల్స్",
+    "tool": "టూల్",
+    "semester": "సెమిస్టర్",
+    "semesters": "సెమిస్టర్లు",
+    "google": "గూగుల్",
+    "uploads": "అప్‌లోడ్స్",
+    "upload": "అప్‌లోడ్",
+    "students": "స్టూడెంట్స్",
+    "student": "స్టూడెంట్",
+    "laptops": "లాప్‌టాప్స్",
+    "laptop": "లాప్‌టాప్",
+    "resumes": "రెజ్యూమ్‌లు",
+    "resume": "రెజ్యూమ్",
+    "interviews": "ఇంటర్వ్యూస్",
+    "interview": "ఇంటర్వ్యూ",
+    "certificates": "సర్టిఫికేట్స్",
+    "certificate": "సర్టిఫికేట్",
+    "courses": "కోర్సెస్",
+    "course": "కోర్స్",
+    "tips": "టిప్స్",
+    "tip": "టిప్",
+    "daily": "డెయిలీ",
+    "notifications": "నోటిఫికేషన్స్",
+    "notification": "నోటిఫికేషన్",
+    "alerts": "అలర్ట్స్",
+    "alert": "అలర్ట్",
+    "hiring": "హైరింగ్",
+    "eligibility": "ఎలిజిబిలిటీ",
+    "internships": "ఇంటర్న్‌షిప్స్",
+    "internship": "ఇంటర్న్‌షిప్",
+    "interns": "ఇంటర్న్స్",
+    "intern": "ఇంటర్న్",
+    "governments": "గవర్న్మెంట్లు",
+    "government": "గవర్న్మెంట్",
+    "govt": "గవర్న్మెంట్",
+    "roadmaps": "రోడ్‌మ్యాప్స్",
+    "roadmap": "రోడ్‌మ్యాప్",
+    "videos": "వీడియోస్",
+    "video": "వీడియో",
+    "links": "లింక్‌లు",
+    "link": "లింక్",
+    "click": "క్లిక్",
+    "downloads": "డౌన్‌లోడ్స్",
+    "download": "డౌన్‌లోడ్",
+    "subscribe": "సబ్స్క్రైబ్",
+    "like": "లైక్",
+    "share": "షేర్",
+    "comment": "కామెంట్",
+    "telugu": "తెలుగు",
+    "freshers": "ఫ్రెషర్స్",
+    "fresher": "ఫ్రెషర్",
+    "radar": "రాడార్",
+    "support": "సపోర్ట్",
+    "ready": "రెడీ",
+    "form": "ఫారం",
+    "date": "డేట్",
+    "last": "లాస్ట్",
+    "degree": "డిగ్రీ",
+    "salary": "శాలరీ",
+    "package": "ప్యాకేజ్",
+    "company": "కంపెనీ",
+    "results": "రిజల్ట్స్",
+    "result": "రిజల్ట్",
+    "paper": "పేపర్",
+    "practice": "ప్రాక్టీస్",
+    "study": "స్టడీ",
+    "online": "ఆన్‌లైన్",
+    "new": "న్యూ",
+    "now": "నౌ",
+    "what": "వాట్",
+}
+
+_WORD_RE = re.compile(
+    r"\b(" + "|".join(sorted((re.escape(w) for w in TELUGU_WORDS), key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def normalize_te(text):
+    """Replaces common English words with a Telugu spelling for the voice."""
+    return _WORD_RE.sub(lambda m: TELUGU_WORDS[m.group(0).lower()], (text or "").strip())
+
+
+def split_phrases(text):
+    """Splits at sentence and comma punctuation so the voice can pause there."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    parts = [p.strip() for p in re.split(r"(?<=[।?!.,;:])\s+", text) if p.strip()]
+    return parts or [text]
+
+
 # ---------------- voice ----------------
 def tts_edge(text, voice, rate, out_path):
     import edge_tts
@@ -176,24 +307,84 @@ def tts_fake(text, voice, rate, out_path):
 ENGINES = {"edge": tts_edge, "gtts": tts_gtts, "fake": tts_fake}
 
 
+PHRASE_GAP_SECONDS = 0.42
+
+
+def join_audio_with_gaps(pieces, out_path, gap=PHRASE_GAP_SECONDS):
+    """Joins audio pieces into one file with a short silence between them."""
+    silence = os.path.join(tempfile.gettempdir(), f"gap_{gap:.2f}.mp3")
+    if not os.path.exists(silence):
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+                "-t", f"{gap:.2f}", "-c:a", "libmp3lame", "-b:a", "64k", silence,
+            ],
+            check=True,
+        )
+    args = ["ffmpeg", "-y", "-loglevel", "error"]
+    for p in pieces:
+        args += ["-i", p]
+    args += ["-i", silence]
+    n = len(pieces)
+    chains = []
+    labels = []
+    for i in range(n):
+        chains.append(f"[{i}:a]aresample=44100[a{i}]")
+        labels.append(f"[a{i}]")
+        if i < n - 1:
+            chains.append(f"[{n}:a]aresample=44100[g{i}]")
+            labels.append(f"[g{i}]")
+    fc = ";".join(chains) + ";" + "".join(labels) + f"concat=n={len(labels)}:v=0:a=1[out]"
+    args += [
+        "-filter_complex", fc, "-map", "[out]",
+        "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "64k", out_path,
+    ]
+    subprocess.run(args, check=True)
+
+
 def make_voice(text, voice, rate, out_path):
-    """Returns the engine name that worked, or None."""
-    for name in TTS_ORDER:
-        fn = ENGINES.get(name)
-        if not fn:
-            continue
-        for attempt in (1, 2):
-            try:
-                if os.path.exists(out_path):
-                    os.remove(out_path)
-                fn(text, voice, rate, out_path)
-                if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
-                    audio_seconds(out_path)
-                    return name
-                raise RuntimeError("audio file is empty")
-            except Exception as exc:  # noqa: BLE001
-                log(f"  voice engine '{name}' attempt {attempt} failed: {type(exc).__name__}: {exc}")
-                time.sleep(2)
+    """Returns the engine name that worked, or None.
+    The text is spoken phrase by phrase with a short silence in between, so the
+    speech gets natural pauses at sentence ends and commas instead of running on."""
+    phrases = split_phrases(normalize_te(text))
+    workdir = tempfile.mkdtemp(prefix="tts_")
+    used = None
+    pieces = []
+    for i, phrase in enumerate(phrases):
+        piece = os.path.join(workdir, f"p{i}.mp3")
+        engine = None
+        for name in TTS_ORDER:
+            fn = ENGINES.get(name)
+            if not fn:
+                continue
+            for attempt in (1, 2):
+                try:
+                    if os.path.exists(piece):
+                        os.remove(piece)
+                    fn(phrase, voice, rate, piece)
+                    if os.path.exists(piece) and os.path.getsize(piece) > 1000:
+                        audio_seconds(piece)
+                        engine = name
+                        break
+                    raise RuntimeError("audio piece is empty")
+                except Exception as exc:  # noqa: BLE001
+                    log(f"  voice engine '{name}' attempt {attempt} failed: {type(exc).__name__}: {exc}")
+                    time.sleep(2)
+            if engine:
+                break
+        if not engine:
+            return None
+        used = used or engine
+        pieces.append(piece)
+    if len(pieces) == 1:
+        with open(pieces[0], "rb") as src, open(out_path, "wb") as dst:
+            dst.write(src.read())
+    else:
+        join_audio_with_gaps(pieces, out_path)
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+        audio_seconds(out_path)
+        return used
     return None
 
 
@@ -369,7 +560,7 @@ def main():
         else:
             audio_rel = None
             seconds = min(9.0, max(2.8, len(text) * 0.075))
-        pad = 1.4 if kind == "cta" else 0.5
+        pad = 1.4 if kind == "cta" else 0.6
         frames = int(math.ceil((seconds + pad) * FPS))
         scenes.append(
             {"kind": kind, "text": text, "label": label, "audio": audio_rel, "image": images[i], "frames": frames}
