@@ -3,10 +3,22 @@ name: Render reel
 on:
   workflow_dispatch:
     inputs:
+      post_id:
+        description: "Post ID (used for release tag reel-<post_id>)"
+        required: true
+        type: string
+      template:
+        description: "Template to render: v1 or v2"
+        required: true
+        type: string
+        default: "v1"
       job:
         description: "Job JSON (paste the content of sample-job.json)"
         required: true
         type: string
+
+permissions:
+  contents: write
 
 jobs:
   render:
@@ -52,15 +64,46 @@ jobs:
       - name: Get Chrome for Remotion
         run: npx remotion browser ensure
 
-      - name: Render video
+      - name: Render video (v1)
+        if: inputs.template == 'v1'
         run: npx remotion render src/index.ts RadarReel out/reel.mp4 --props=public/props.json
+
+      - name: Render video (v2)
+        if: inputs.template == 'v2'
+        run: npx remotion render src-v2/index.ts RadarReelV2 out/reel.mp4 --props=public/props.json
 
       - name: Save the video and the log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: reel
+          name: reel-${{ inputs.template }}
           path: |
             out/reel.mp4
             out/build-log.txt
           retention-days: 14
+
+      - name: Publish release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="reel-${{ inputs.post_id }}"
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          gh release create "$TAG" out/reel.mp4 out/build-log.txt \
+            --title "Reel ${{ inputs.post_id }} (${{ inputs.template }})" \
+            --notes "Rendered from post ${{ inputs.post_id }} using template ${{ inputs.template }}"
+
+      - name: Prune releases older than 30 days
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CUTOFF=$(date -d "-30 days" +%s)
+          gh release list --json tagName,publishedAt --limit 100 | \
+            jq -r '.[] | select(.tagName | startswith("reel-")) | "\(.tagName)\t\(.publishedAt)"' | \
+            while IFS=$'\t' read -r tag published; do
+              published_epoch=$(date -d "$published" +%s 2>/dev/null || echo 0)
+              if [ "$published_epoch" -lt "$CUTOFF" ]; then
+                gh release delete "$tag" --yes 2>/dev/null || true
+              fi
+            done

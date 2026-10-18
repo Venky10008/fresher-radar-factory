@@ -1,9 +1,19 @@
 """
 Prepares everything Remotion needs for one reel:
   1. Telugu voice-over for every scene (edge-tts first, Google TTS as backup, silent if both fail)
+     - Optional job fields voice_hook_te / voice_summary_te / voice_students_te / voice_cta_te:
+       the same sentences in PURE Telugu script (English words spelled phonetically).
+       When present the voice reads these; the screen still shows the normal text.
+       When missing, normalize_te() + the ~90-word dictionary is used as before.
+     - edge-tts word boundaries (boundary="WordBoundary") become scene.words in
+       props.json, so captions reveal word-by-word with the voice.
+     - Every clip is speed-pulled toward the run's average speech rate and
+       loudness-normalized (loudnorm -16 LUFS / -1.5 dBTP), so speed and level
+       are uniform across scenes.
   2. One picture per scene from the image prompts (Cloudflare FLUX, then Pollinations; a motion graphic is drawn if both fail)
   3. A soft background music pad (made with ffmpeg, no download needed)
-  4. public/props.json
+  4. A subtle transition whoosh (sfx, ffmpeg) — disable with job "sfx": false
+  5. public/props.json (scenes also carry optional audioSeconds + words)
 The video is always made, even if voice or pictures fail.
 """
 import asyncio
@@ -21,6 +31,12 @@ import urllib.parse
 import urllib.request
 
 FPS = 30
+# Telugu text goes to stdout; make sure any console (Windows cp1252 included)
+# can print it instead of crashing the run.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+except Exception:  # noqa: BLE001
+    pass
 VOICE_DEFAULT = "te-IN-ShrutiNeural"  # other Telugu voice: te-IN-MohanNeural
 RATE_DEFAULT = "+0%"  # normal speed keeps the Telugu speech clear
 FONT_MODE = os.environ.get("FONT_MODE", "web")
@@ -283,16 +299,55 @@ def split_phrases(text):
 
 
 # ---------------- voice ----------------
+# Words the voice reads badly are either pre-translated (voice_*_te fields in
+# the job, pure Telugu script) or replaced with a Telugu spelling from the
+# dictionary below. Anything left in Latin script is reported in the log so a
+# job with brand-new English words is visible immediately.
+LATIN_RE = re.compile(r"[A-Za-z]+")
+
+# Each clip's speed is pulled toward the run's average speech rate so a reel
+# never speeds up and slows down between sentences (gTTS vs edge, short vs
+# long sentences). Corrections stay small to avoid chipmunk artefacts.
+ATEMPO_MIN = 0.90
+ATEMPO_MAX = 1.15
+# Per-clip loudness target; the final master is normalised to -14 LUFS in CI.
+VOICE_LOUDNESS = "loudnorm=I=-16:TP=-1.5:LRA=11"
+
+
 def tts_edge(text, voice, rate, out_path):
+    """Synthesizes with edge-tts and returns word boundaries.
+
+    Returns [(t_ms, d_ms, word), ...]. edge-tts only sends WordBoundary
+    events when boundary="WordBoundary" is requested — confirmed to work for
+    te-IN-ShrutiNeural, which gives us frame-accurate captions.
+    """
     import edge_tts
 
-    asyncio.run(edge_tts.Communicate(text, voice, rate=rate).save(out_path))
+    async def run():
+        com = edge_tts.Communicate(text, voice, rate=rate, boundary="WordBoundary")
+        words = []
+        with open(out_path, "wb") as f:
+            async for chunk in com.stream():
+                if chunk["type"] == "audio":
+                    f.write(chunk["data"])
+                elif chunk["type"] == "WordBoundary":
+                    words.append(
+                        (
+                            chunk["offset"] / 1e7 * 1000.0,  # ms
+                            chunk["duration"] / 1e7 * 1000.0,  # ms
+                            chunk["text"],
+                        )
+                    )
+        return words
+
+    return asyncio.run(run())
 
 
 def tts_gtts(text, voice, rate, out_path):
     from gtts import gTTS
 
     gTTS(text=text, lang="te").save(out_path)
+    return None  # gTTS sends no word timings
 
 
 def tts_fake(text, voice, rate, out_path):
@@ -302,6 +357,8 @@ def tts_fake(text, voice, rate, out_path):
         ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", f"sine=f=220:d={seconds}", "-af", "volume=0.05", out_path],
         check=True,
     )
+    return None
+
 
 
 ENGINES = {"edge": tts_edge, "gtts": tts_gtts, "fake": tts_fake}
@@ -312,16 +369,7 @@ PHRASE_GAP_SECONDS = 0.42
 
 def join_audio_with_gaps(pieces, out_path, gap=PHRASE_GAP_SECONDS):
     """Joins audio pieces into one file with a short silence between them."""
-    silence = os.path.join(tempfile.gettempdir(), f"gap_{gap:.2f}.mp3")
-    if not os.path.exists(silence):
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
-                "-t", f"{gap:.2f}", "-c:a", "libmp3lame", "-b:a", "64k", silence,
-            ],
-            check=True,
-        )
+    silence = silence_path(gap)
     args = ["ffmpeg", "-y", "-loglevel", "error"]
     for p in pieces:
         args += ["-i", p]
@@ -343,17 +391,22 @@ def join_audio_with_gaps(pieces, out_path, gap=PHRASE_GAP_SECONDS):
     subprocess.run(args, check=True)
 
 
-def make_voice(text, voice, rate, out_path):
-    """Returns the engine name that worked, or None.
-    The text is spoken phrase by phrase with a short silence in between, so the
-    speech gets natural pauses at sentence ends and commas instead of running on."""
-    phrases = split_phrases(normalize_te(text))
+def synth_phrases(tts_text, voice, rate):
+    """Synthesizes one scene phrase by phrase (short pauses between phrases).
+
+    Returns {"pieces": [(path, words|None)], "cps": float, "engine": name}
+    or None when every engine failed.
+    cps = characters per second of actual speech (gaps excluded) — used to
+    bring every clip in the run to the same speaking speed.
+    """
+    phrases = split_phrases(tts_text)
     workdir = tempfile.mkdtemp(prefix="tts_")
-    used = None
     pieces = []
+    scene_engine = None
     for i, phrase in enumerate(phrases):
         piece = os.path.join(workdir, f"p{i}.mp3")
         engine = None
+        words = None
         for name in TTS_ORDER:
             fn = ENGINES.get(name)
             if not fn:
@@ -362,7 +415,7 @@ def make_voice(text, voice, rate, out_path):
                 try:
                     if os.path.exists(piece):
                         os.remove(piece)
-                    fn(phrase, voice, rate, piece)
+                    words = fn(phrase, voice, rate, piece)
                     if os.path.exists(piece) and os.path.getsize(piece) > 1000:
                         audio_seconds(piece)
                         engine = name
@@ -375,17 +428,88 @@ def make_voice(text, voice, rate, out_path):
                 break
         if not engine:
             return None
-        used = used or engine
-        pieces.append(piece)
+        scene_engine = scene_engine or engine
+        # only edge gives timings; if a later phrase fell back, drop them all
+        if engine != "edge":
+            words = None
+        pieces.append((piece, words))
+    speech_chars = len(re.sub(r"\s+", "", tts_text)) or 1
+    speech_time = sum(audio_seconds(p) for p, _ in pieces) or 0.001
+    return {
+        "pieces": pieces,
+        "cps": speech_chars / speech_time,
+        "engine": scene_engine,
+    }
+
+
+def silence_path(gap):
+    path = os.path.join(tempfile.gettempdir(), f"gap_{gap:.2f}.mp3")
+    if not os.path.exists(path):
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+                "-t", f"{gap:.2f}", "-c:a", "libmp3lame", "-b:a", "64k", path,
+            ],
+            check=True,
+        )
+    return path
+
+
+def finalize_scene(synth, out_path, atempo=1.0):
+    """Joins the phrases with short gaps, applies the speed correction and
+    loudness-normalizes the clip. Returns {"seconds", "words"} where words
+    are [{t, d, w}] in milliseconds on the FINAL timeline, or None.
+    """
+    pieces = synth["pieces"]
+    gap = PHRASE_GAP_SECONDS
+
+    # word boundaries measured on the original timeline (all values in ms)
+    words_out = None
+    if all(w is not None for _, w in pieces):
+        words_out = []
+        offset_ms = 0.0
+        for path, w in pieces:
+            for t_ms, d_ms, txt in w:
+                words_out.append(
+                    {
+                        "t": int(round((offset_ms + t_ms) / atempo)),
+                        "d": int(round(d_ms / atempo)),
+                        "w": txt,
+                    }
+                )
+            offset_ms += audio_seconds(path) * 1000.0 + gap * 1000.0
+        # the last gap is not part of the clip
+        if len(pieces) > 1:
+            offset_ms -= gap * 1000.0
+
+    joined = out_path + ".joined.mp3"
     if len(pieces) == 1:
-        with open(pieces[0], "rb") as src, open(out_path, "wb") as dst:
+        with open(pieces[0][0], "rb") as src, open(joined, "wb") as dst:
             dst.write(src.read())
     else:
-        join_audio_with_gaps(pieces, out_path)
-    if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
-        audio_seconds(out_path)
-        return used
-    return None
+        join_audio_with_gaps([p for p, _ in pieces], joined)
+
+    filters = []
+    if abs(atempo - 1.0) > 0.01:
+        filters.append(f"atempo={atempo:.4f}")
+    filters.append(VOICE_LOUDNESS)
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", joined,
+            "-af", ",".join(filters),
+            "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "160k",
+            out_path,
+        ],
+        check=True,
+    )
+    if os.path.exists(joined):
+        os.remove(joined)
+    if not os.path.exists(out_path) or os.path.getsize(out_path) < 1000:
+        return None
+    return {"seconds": audio_seconds(out_path), "words": words_out}
+
 
 
 # ---------------- pictures ----------------
@@ -454,6 +578,28 @@ def make_image(prompt, seed, out_path):
     return None
 
 
+# ---------------- sfx ----------------
+def make_sfx(out_path):
+    """A short, quiet noise whoosh for scene cuts — generated with ffmpeg."""
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "lavfi", "-i", "anoisesrc=color=pink:duration=0.70:seed=3",
+            "-af",
+            (
+                "lowpass=f=2500,"
+                "afade=t=in:d=0.04,afade=t=out:st=0.60:d=0.10,"
+                "aformat=sample_rates=44100:channel_layouts=mono"
+            ),
+            "-c:a", "libmp3lame", "-b:a", "96k",
+            out_path,
+        ],
+        check=True,
+    )
+    if not os.path.exists(out_path) or os.path.getsize(out_path) < 1000:
+        raise RuntimeError("sfx file is empty")
+
+
 # ---------------- music ----------------
 def make_music(seconds, root, out_path):
     """A soft, slow pad: open chord, gentle tremolo, low-pass and echo. No download needed."""
@@ -480,6 +626,7 @@ def main():
     voice = job.get("voice") or VOICE_DEFAULT
     rate = job.get("rate") or RATE_DEFAULT
     want_music = job.get("music", True)
+    want_sfx = job.get("sfx", True)
 
     for d in ("public/audio", "public/images"):
         os.makedirs(d, exist_ok=True)
@@ -503,26 +650,115 @@ def main():
         log("ERROR: job needs at least hook_te or summary_te")
         sys.exit(1)
 
+    # ----- which text the voice speaks -----
+    # Optional pure-Telugu fields (voice_hook_te / voice_summary_te /
+    # voice_students_te / voice_cta_te): the same sentences written only in
+    # Telugu script with English words spelled phonetically. When present the
+    # voice reads THESE and the screen still shows the normal text. When
+    # missing we fall back to normalize_te() + the ~90-word dictionary.
+    hook_voice = (job.get("voice_hook_te") or "").strip()
+    students_voice = (job.get("voice_students_te") or "").strip()
+    cta_voice = (job.get("voice_cta_te") or "").strip()
+    raw_summary_voice = (job.get("voice_summary_te") or "").strip()
+    summary_voice_parts = split_sentences(raw_summary_voice) if raw_summary_voice else []
+    summary_display_parts = [t for k, t, _ in plan if k == "line"]
+
+    voice_texts = []
+    line_i = 0
+    for kind, text, _label in plan:
+        if kind == "hook":
+            voice_texts.append(hook_voice)
+        elif kind == "line":
+            if summary_voice_parts and len(summary_voice_parts) == len(summary_display_parts):
+                voice_texts.append(summary_voice_parts[line_i])
+            else:
+                if summary_voice_parts:
+                    log(
+                        f"WARNING: voice_summary_te has {len(summary_voice_parts)} sentences but the screen "
+                        f"has {len(summary_display_parts)} — line scenes fall back to the dictionary"
+                    )
+                voice_texts.append("")
+            line_i += 1
+        elif kind == "students":
+            voice_texts.append(students_voice)
+        else:
+            voice_texts.append(cta_voice)
+    from_field_count = sum(1 for v in voice_texts if v)
+    if from_field_count:
+        log(f"voice_*_te fields used for {from_field_count}/{len(plan)} scenes (pure Telugu for the voice)")
+
     # ----- voice -----
     log("== Voice-over ==")
-    voice_engine = None
-    voiced = []
-    for i, (kind, text, label) in enumerate(plan):
-        rel = f"audio/scene_{i}.mp3"
-        full = os.path.join("public", rel)
-        engine = make_voice(text, voice, rate, full)
-        if not engine:
-            voiced = None
+    synths = []
+    for i, (kind, text, _label) in enumerate(plan):
+        tts_text = (voice_texts[i] or "").strip() or normalize_te(text)
+        from_field = bool((voice_texts[i] or "").strip())
+        latin = LATIN_RE.findall(tts_text)
+        if from_field:
+            status = (
+                "pure Telugu PASS"
+                if not latin
+                else f"NOT pure Telugu — Latin words: {sorted(set(w.lower() for w in latin))}"
+            )
+            log(f"scene {i} ({kind}) TTS text from voice_*_te: {status}")
+            if latin:
+                log("  WARNING: voice_*_te must be Telugu script only; these Latin words will be mispronounced")
+        else:
+            if latin:
+                new_words = sorted(set(w.lower() for w in latin))
+                log(
+                    f"scene {i} ({kind}) dictionary fallback — brand-new English words NOT in the "
+                    f"dictionary, sent to TTS as-is: {new_words}"
+                )
+                log("  (edge-tts will read them with English pronunciation; durations below show the result)")
+            else:
+                log(f"scene {i} ({kind}) dictionary fallback — text is pure Telugu script")
+        log(f"  text sent to TTS: {tts_text}")
+        s = synth_phrases(tts_text, voice, rate)
+        if s is None:
+            synths = None
             break
-        voice_engine = voice_engine or engine
-        voiced.append((rel, audio_seconds(full)))
-    if voiced is None:
+        synths.append((s, tts_text, from_field))
+
+    voiced = None
+    if synths is None:
         log("WARNING: voice-over failed for every engine. The video will be silent.")
         for fname in os.listdir("public/audio"):
             if fname != ".gitkeep":
                 os.remove(os.path.join("public/audio", fname))
     else:
-        log(f"voice engine used: {voice_engine}")
+        # uniform speed: pull every clip toward the run's average speech rate
+        cps_values = [s["cps"] for s, _, _ in synths]
+        target_cps = sum(cps_values) / len(cps_values)
+        voice_engine = synths[0][0]["engine"]
+        voiced = []
+        for i, (s, tts_text, _from_field) in enumerate(synths):
+            atempo = 1.0
+            if len(synths) > 1 and s["cps"] > 0:
+                atempo = min(ATEMPO_MAX, max(ATEMPO_MIN, target_cps / s["cps"]))
+            rel = f"audio/scene_{i}.mp3"
+            full = os.path.join("public", rel)
+            res = finalize_scene(s, full, atempo)
+            if res is None:
+                log(f"scene {i}: finalizing the clip failed")
+                voiced = None
+                break
+            n_words = len(res["words"]) if res["words"] else 0
+            log(
+                f"scene {i}: {res['seconds']:.2f}s engine={s['engine']} "
+                f"cps={s['cps']:.1f} atempo={atempo:.3f} word_timings={n_words}"
+            )
+            voiced.append((rel, res["seconds"], res["words"]))
+        if voiced is None:
+            for fname in os.listdir("public/audio"):
+                if fname != ".gitkeep":
+                    os.remove(os.path.join("public/audio", fname))
+        else:
+            log(
+                f"voice engine used: {voice_engine}; speech-rate target {target_cps:.1f} chars/s "
+                f"(every clip pulled toward it, range {ATEMPO_MIN}-{ATEMPO_MAX})"
+            )
+
 
     # ----- pictures -----
     log("== Pictures ==")
@@ -554,17 +790,23 @@ def main():
     # ----- timing -----
     scenes = []
     for i, (kind, text, label) in enumerate(plan):
+        words = None
         if voiced:
-            rel, seconds = voiced[i]
+            rel, seconds, words = voiced[i]
             audio_rel = rel
         else:
             audio_rel = None
             seconds = min(9.0, max(2.8, len(text) * 0.075))
         pad = 1.4 if kind == "cta" else 0.6
         frames = int(math.ceil((seconds + pad) * FPS))
-        scenes.append(
-            {"kind": kind, "text": text, "label": label, "audio": audio_rel, "image": images[i], "frames": frames}
-        )
+        scene = {"kind": kind, "text": text, "label": label, "audio": audio_rel, "image": images[i], "frames": frames}
+        # optional fields (only present when the voice pipeline produced them,
+        # so older props consumers keep working unchanged)
+        if audio_rel:
+            scene["audioSeconds"] = round(seconds, 3)
+        if words:
+            scene["words"] = words
+        scenes.append(scene)
 
     total = sum(s["frames"] for s in scenes) / FPS
 
@@ -578,6 +820,19 @@ def main():
         except Exception as exc:  # noqa: BLE001
             log(f"WARNING: music failed ({exc}). Continuing without music.")
 
+    # ----- transition sound -----
+    sfx_rel = None
+    sfx_path = "public/sfx_whoosh.mp3"
+    if os.path.exists(sfx_path):
+        os.remove(sfx_path)
+    if want_sfx:
+        try:
+            make_sfx(sfx_path)
+            sfx_rel = "sfx_whoosh.mp3"
+            log("== SFX == subtle transition whoosh created")
+        except Exception as exc:  # noqa: BLE001
+            log(f"WARNING: transition sound failed ({exc}). Continuing without it.")
+
     props = {
         "brand": job.get("brand") or "Fresher Radar",
         "category": category if category in CATEGORY else "ai_tools",
@@ -589,6 +844,7 @@ def main():
         "seed": seed,
         "fontMode": FONT_MODE,
         "music": music_rel,
+        "sfx": sfx_rel,
         "scenes": scenes,
     }
     with open("public/props.json", "w", encoding="utf-8") as f:

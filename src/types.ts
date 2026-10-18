@@ -1,5 +1,18 @@
 export type SceneKind = "hook" | "line" | "students" | "cta";
 
+/** One spoken word with its timing inside the scene audio, in milliseconds
+ * from the start of the audio file. Provided by edge-tts word boundaries when
+ * available; when missing the template reveals words proportionally. */
+export type TimedWord = {
+  /** milliseconds from the start of the scene audio */
+  t: number;
+  /** duration in milliseconds */
+  d: number;
+  /** the word as it was sent to the voice engine (may be the Telugu
+   * phonetic spelling when the display word is English) */
+  w: string;
+};
+
 export type Scene = {
   kind: SceneKind;
   /** Text shown on screen and spoken in the voice-over */
@@ -12,6 +25,10 @@ export type Scene = {
   image: string | null;
   /** Length of this scene in frames (30 fps) */
   frames: number;
+  /** OPTIONAL: duration of the voice-over in seconds (used to duck the music) */
+  audioSeconds?: number;
+  /** OPTIONAL: word timings from the voice engine, milliseconds from the audio start */
+  words?: TimedWord[];
 };
 
 export type ReelProps = {
@@ -30,4 +47,7 @@ export type ReelProps = {
   /** Background music file inside /public, or null */
   music: string | null;
   scenes: Scene[];
+  /** OPTIONAL: subtle transition sound (a short whoosh) inside /public, or null */
+  sfx?: string | null;
 };
+
