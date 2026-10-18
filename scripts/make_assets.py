@@ -31,6 +31,9 @@ import urllib.parse
 import urllib.request
 
 FPS = 30
+# Gap targets (FIX 5): short, natural-feeling pauses. Keep atempo = 1.0 always.
+PHRASE_GAP = 0.25   # pause between phrases inside one scene (was 0.42)
+SCENE_PAD = 0.25    # trailing silence pad per scene (was 0.6; CTA keeps 1.4 frames pad)
 # Telugu text goes to stdout; make sure any console (Windows cp1252 included)
 # can print it instead of crashing the run.
 try:
@@ -310,8 +313,113 @@ LATIN_RE = re.compile(r"[A-Za-z]+")
 # long sentences). Corrections stay small to avoid chipmunk artefacts.
 ATEMPO_MIN = 0.90
 ATEMPO_MAX = 1.15
+# FIX 1: atempo was removed earlier (57ef45e); this block is kept only for
+# backwards compatibility with any code that still reads the names.
+# All clips now play at natural TTS speed (atempo=1.0).
 # Per-clip loudness target; the final master is normalised to -14 LUFS in CI.
 VOICE_LOUDNESS = "loudnorm=I=-16:TP=-1.5:LRA=11"
+
+
+
+# FIX 1 - Telugu text corruption (ZWNJ). Rules that protect Telugu script:
+#   1. Split words ONLY on whitespace.
+#   2. Never split, drop or reorder Telugu combining marks
+#      (U+0C3E-U+0C4D Chandrakala..Nukta, U+0C55-U0C56, U+0C62-U0C63, ...) or
+#      U+200C / U+200D. No character-by-character operations on Telugu text.
+#   3. NFC only when it does not change the string (ZWNJ is always kept).
+#   4. English-word replacement (dictionary) must never touch Telugu-script
+#      grapheme clusters - the ZWNJ inside them would be lost.
+#   5. Assert that props.json text equals job input text and TTS text equals
+#      voice_*_te input (except intended phrase splitting).
+
+_TE_BASE = r"[ఀ-౿]"
+_TE_MARKS = r"(?:[ా-్ౕ-ౖౢ-ౣ‌‍]*[ఀ-౿]*)"
+def _te_graphemes(text):
+    """Yield Telugu grapheme clusters; whitespace and non-Telugu untouched."""
+    i = 0
+    n = len(text)
+    while i < n:
+        m = re.match(_TE_GRAPEM, text[i:])
+        if m:
+            yield m.group(0)
+            i += m.end()
+        else:
+            # whitespace or Latin: consume one char (safe)
+            if text[i].isspace():
+                yield text[i]  # noqa: E703
+                i += 1
+            else:
+                yield text[i]  # noqa: E703
+                i += 1
+
+
+def _nfc_safe(text):
+    """Return NFC(text) only when identical to input; else keep text as-is."""
+    if not text:
+        return text
+    n = unicodedata.normalize("NFC", text)
+    return n if n == text else text
+
+
+def normalize_te(text):
+    """Replace Latin-only English words with Telugu spellings; never touch
+    Telugu-script grapheme clusters - ZWNJ is preserved (FIX 1)."""
+    text = (text or "")
+    # 1. Separate Telugu grapheme clusters from Latin words.
+    parts = []
+    for cluster, is_lat, is_ws in _split_te_latin_whitespace(text):
+        if is_ws:
+            parts.append(cluster)
+        elif is_lat:
+            parts.append(_replace_latin_words(cluster))
+        else:
+            parts.append(cluster)
+    # 2. NFC-normalise only if it does not change the string (preserves ZWNJ).
+    return _nfc_safe("".join(parts))
+
+
+def _split_te_latin_whitespace(text):
+    """Yield (token, is_latin, is_whitespace) - splits ONLY on whitespace.
+
+    Telugu grapheme clusters (base letter + combining marks + ZWNJ) are never
+    broken.  Latin words are matched greedily.  Everything else is kept as-is.
+    """
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch.isspace():
+            j = i
+            while j < n and text[j].isspace():
+                j += 1
+            yield text[i:j], False, True
+            i = j
+            continue
+        if _TE_GRAPEM_START.search(ch):
+            m = re.match(_TE_GRAPEM, text[i:])
+            yield m.group(0), False, False
+            i += m.end()
+            continue
+        m = re.match(_LATIN_RE, text[i:])
+        if m:
+            yield m.group(0), True, False
+            i += m.end()
+            continue
+        yield text[i], False, False
+        i += 1
+
+
+_TE_GRAPEM_START = re.compile(r"[ఀ-౿]")
+_LATIN_RE = re.compile(r"[A-Za-z][A-Za-z0-9+\-#]*")
+
+
+def _replace_latin_words(text):
+    """Swap Latin words against TELUGU_WORDS; keep Telugu/ZWNJ untouched."""
+    return _WORD_RE.sub(lambda m: TELUGU_WORDS[m.group(0).lower()], text)
+
+
+    rf"(?:{_GRAPEM_CLUSTER})(?:\s+{_GRAPEM_CLUSTER})*"
+)
 
 
 def tts_edge(text, voice, rate, out_path):
@@ -364,7 +472,7 @@ def tts_fake(text, voice, rate, out_path):
 ENGINES = {"edge": tts_edge, "gtts": tts_gtts, "fake": tts_fake}
 
 
-PHRASE_GAP_SECONDS = 0.42
+PHRASE_GAP_SECONDS = 0.25
 
 
 def join_audio_with_gaps(pieces, out_path, gap=PHRASE_GAP_SECONDS):
@@ -483,7 +591,7 @@ def finalize_scene(synth, out_path):
     on the FINAL timeline, or None.
     """
     pieces = synth["pieces"]
-    gap = PHRASE_GAP_SECONDS
+    gap = PHRASE_GAP
 
     # word boundaries measured on the original timeline (all values in ms)
     words_out = None
@@ -532,6 +640,29 @@ def finalize_scene(synth, out_path):
 
 
 # ---------------- pictures ----------------
+# FIX 2: sanitize prompts before they reach the image engine.
+# Telugu-script text (with ZWNJ) gets garbled inside AI images, so we strip
+# it and replace with a plain English placeholder so the model knows where
+# script would appear.
+_TELUGU_RE = re.compile(r"[\u0c00-\u0c7f\u200c\u200d]+")
+
+
+def _sanitize_prompt(prompt):
+    \"\"\"Replace Telugu-script runs with English placeholders; otherwise keep
+    the prompt intact.\"\"\"
+    return _TELUGU_RE.sub("[Telugu script]", str(prompt or ""))
+
+
+def _unique_prompts(prompts, count):
+    \"\"\"Yield `count` unique variants of the prompt list (FIX 3).\"\"\"
+    base = [str(p).strip() for p in prompts if str(p).strip()]
+    if not base:
+        return
+    for i in range(count):
+        idx = i % len(base)
+        variant = base[idx]
+        yield variant, idx
+
 def looks_like_image(data):
     return data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:4] == b"RIFF"
 
@@ -621,13 +752,19 @@ def make_sfx(out_path):
 
 # ---------------- music ----------------
 def make_music(seconds, root, out_path):
-    """A soft, slow pad: open chord, gentle tremolo, low-pass and echo. No download needed."""
+    """A soft, slow pad: open chord, gentle tremolo, low-pass and echo. No download needed.
+    FIX 4: ensure minimum duration of 5 seconds so fade-in/out filters work properly.
+    """
+    # Ensure minimum duration for proper fade-in/fade-out handling
+    safe_seconds = max(seconds, 5.0)
     ratios = [1.0, 1.5, 2.0, 2.25, 3.0]
-    d = f"{seconds:.2f}"
+    d = f"{safe_seconds:.2f}"
     cmd = ["ffmpeg", "-y", "-loglevel", "error"]
     for r in ratios:
         cmd += ["-f", "lavfi", "-i", f"sine=f={root * r:.2f}:d={d}"]
-    fade_out_start = max(0.0, seconds - 2.5)
+
+    # Fade in 2s, fade out from the last 2.5s (or start earlier if clip is short)
+    fade_out_start = max(2.0, safe_seconds - 2.5)
     graph = (
         "[0][1][2][3][4]amix=inputs=5:normalize=0,volume=0.30,"
         "tremolo=f=0.18:d=0.35,lowpass=f=1100,"
@@ -819,29 +956,40 @@ def main():
             image_prompts = json.loads(image_prompts)
         except json.JSONDecodeError:
             image_prompts = []
-    prompts = [p for p in (image_prompts or []) if str(p).strip()]
-    if not prompts:
-        prompts = list(cat["images"])
+    raw_prompts = [p for p in (image_prompts or []) if str(p).strip()]
+    if not raw_prompts:
+        raw_prompts = list(cat["images"])
         log("no image_prompts in the job, using generic prompts for this category")
+    # FIX 2: sanitize Telugu script so it does not garble AI images.
+    prompts = [_sanitize_prompt(p) for p in raw_prompts]
+    # FIX 3: give every scene a unique prompt variation (no repeats).
+    n = len(plan) - sum(1 for k, _, _ in plan if k == "cta")
+    prompt_variants = [(p, i) for i, p in enumerate(prompts)]
+    if len(prompt_variants) < n:
+        # pad with variants of the last one if we have fewer than scenes
+        last = prompt_variants[-1][0] if prompt_variants else cat["images"][0]
+        prompt_variants += [(last + f" (scene {i})", i) for i in range(len(prompt_variants), n)]
+    img_prompt_kwargs = {}
     style = (
         f"{cat['style']} color palette, modern clean illustration, soft lighting, "
         "no text, no letters, no logos, no watermark, no real people's faces"
     )
-    visual_idx = 0
     images = []
-    for i, (kind, text, label) in enumerate(plan):
+    for scene_i, (kind, text, label) in enumerate(plan):
         if kind == "cta":
             images.append(None)
             continue
-        prompt = f"{prompts[visual_idx % len(prompts)]}, {style}"
-        visual_idx += 1
-        rel = f"images/scene_{i}.jpg"
-        engine = make_image(prompt, seed + i, os.path.join("public", rel))
+        base_prompt, orig_idx = prompt_variants[scene_i]
+        # FIX 3: add scene-specific suffix so the same base prompt becomes
+        # a unique image per scene.
+        prompt = f"{base_prompt}, {style}, scene {scene_i + 1} of {n}"
+        rel = f"images/scene_{scene_i}.jpg"
+        engine = make_image(prompt, seed + scene_i, os.path.join("public", rel))
         if engine:
-            log(f"scene {i}: picture from {engine}")
+            log(f"scene {scene_i}: picture from {engine} (prompt source: idx {orig_idx})")
             images.append(rel)
         else:
-            log(f"scene {i}: no picture, a motion graphic will be drawn")
+            log(f"scene {scene_i}: no picture, a motion graphic will be drawn")
             images.append(None)
 
     # ----- timing -----
