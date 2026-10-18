@@ -7,14 +7,20 @@ export const FPS = 30;
 
 const defaultProps: ReelProps = {
   brand: "Fresher Radar",
+  category: "ai_tools",
   categoryLabel: "AI tools",
-  toolName: "Sample Tool",
+  badge: "New AI tool",
+  tagline: "Daily AI tools, internships, jobs",
+  toolName: "NotebookLM",
   pricing: "free",
+  seed: 7,
+  fontMode: "web",
+  music: null,
   scenes: [
-    { kind: "hook", text: "ఈ free AI tool తో మీ resume 2 నిమిషాల్లో రెడీ!", audio: null, frames: 120 },
-    { kind: "line", text: "కొత్త AI tool వచ్చింది. మీ details ఇస్తే resume ని automatic గా తయారు చేస్తుంది.", audio: null, frames: 150 },
-    { kind: "students", text: "B.Tech students placements కి quick గా resume రెడీ చేసుకోవచ్చు.", audio: null, frames: 130 },
-    { kind: "cta", text: "రోజూ ఇలాంటి updates కోసం bio లో ఉన్న Fresher Radar group లో join అవ్వండి.", audio: null, frames: 150 },
+    { kind: "hook", text: "మీ notes ని podcast లా వినాలా? NotebookLM ట్రై చేయండి!", label: "", audio: null, image: null, frames: 120 },
+    { kind: "line", text: "Google NotebookLM లో PDFs upload చేస్తే summary, quiz, audio overview అన్నీ తయారు చేస్తుంది.", label: "What it does", audio: null, image: null, frames: 170 },
+    { kind: "students", text: "Semester exams ముందు long PDFs ని fast గా revise చేయడానికి చాలా ఉపయోగం.", label: "For B.Tech students", audio: null, image: null, frames: 150 },
+    { kind: "cta", text: "రోజూ ఇలాంటి AI tools updates కోసం, bio లో ఉన్న Fresher Radar group లో join అవ్వండి.", label: "", audio: null, image: null, frames: 170 },
   ],
 };
 
@@ -23,7 +29,7 @@ export const RemotionRoot: React.FC = () => {
     <Composition
       id="RadarReel"
       component={RadarReel}
-      durationInFrames={550}
+      durationInFrames={610}
       fps={FPS}
       width={1080}
       height={1920}

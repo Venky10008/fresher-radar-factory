@@ -4,5 +4,10 @@
   "pricing": "free",
   "hook_te": "మీ notes ని podcast లా వినాలా? NotebookLM ట్రై చేయండి!",
   "summary_te": "Google NotebookLM లో PDFs upload చేస్తే summary, quiz, audio overview అన్నీ తయారు చేస్తుంది. Telugu audio overviews కూడా సపోర్ట్ చేస్తుంది.",
-  "for_students_te": "Semester exams ముందు long PDFs ని fast గా revise చేయడానికి చాలా ఉపయోగం."
+  "for_students_te": "Semester exams ముందు long PDFs ని fast గా revise చేయడానికి చాలా ఉపయోగం.",
+  "image_prompts": [
+    "a student listening to a podcast made from study notes, headphones, laptop with a notebook app, cozy desk",
+    "a laptop showing a PDF turning into a summary and quiz cards, floating study icons",
+    "a college student revising before an exam with a laptop and highlighters, bright and calm"
+  ]
 }

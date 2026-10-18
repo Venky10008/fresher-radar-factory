@@ -1,17 +1,21 @@
 # Fresher Radar video factory
 
-Makes a 9:16 reel (Telugu voice-over + animated text) from a JSON job. Runs on GitHub Actions, free on a public repo.
+Makes a 9:16 reel from a JSON job: Telugu voice-over, a picture for every scene, soft music,
+a look that changes with the category, and a layout that changes from video to video.
+Runs on GitHub Actions (free on a public repo).
 
-## First test
-1. Push these files to a PUBLIC GitHub repo.
-2. Open the repo > Actions > "Render reel" > Run workflow.
-3. Paste the content of sample-job.json into the "job" box. Run.
-4. When the run turns green, open it and download the "reel" artifact (reel.mp4).
+## Run it
+Actions > "Render reel" > Run workflow > paste the content of sample-job.json > Run.
+When it turns green, open the run and download the artifact "reel": reel.mp4 and build-log.txt.
+build-log.txt says whether the voice and the pictures worked.
 
-## Job JSON fields
-category (ai_tools, govt_jobs, private_jobs, internships, certificates, career_boost), tool_name, pricing,
-hook_te, summary_te, for_students_te. Optional: cta_te, voice (te-IN-ShrutiNeural or te-IN-MohanNeural), rate.
+## Pictures (optional but recommended)
+Add two repository secrets (Settings > Secrets and variables > Actions):
+CF_ACCOUNT_ID and CF_API_TOKEN (Cloudflare Workers AI). Without them the factory tries Pollinations,
+and if that fails too it draws a motion graphic instead of a picture.
 
-## Notes
-- If the voice-over service fails, the video is still rendered silent.
-- Later, n8n can start this workflow through the GitHub API (workflow_dispatch).
+## Job JSON
+category: ai_tools, govt_jobs, private_jobs, internships, certificates, career_boost
+tool_name, pricing, hook_te, summary_te, for_students_te
+image_prompts: 3 short English picture descriptions (no real people, no brand logos, no text in the picture)
+Optional: cta_te, voice (te-IN-ShrutiNeural or te-IN-MohanNeural), rate, music (true or false)
