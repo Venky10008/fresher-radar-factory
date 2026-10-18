@@ -33,6 +33,15 @@ Ran `make_assets.py` with the Task 3 sample job (Sphinx, 6 scenes):
 - All max_volume values below 0 dB → no clipping.
 - edge-tts engine used for all clips; word-boundary timings present in props.json.
 
+### Fix — Uneven voice speed (atempo removed, short scenes merged)
+
+- Removed per-clip `atempo` time-stretching from `finalize_scene()` — every clip now plays at natural TTS speed (atempo=1.0).
+- Added scene merging: any scene with fewer than 3 spoken words is merged with the next scene, preserving full-stop pauses between phrases.
+- Silence padding is NOT used — scene length is determined by audio duration + existing pad, so no stretching is ever needed.
+- `loudnorm` and `check_clipping` unchanged.
+
+Verified with Sphinx sample job: 5 scenes after merging, all atempo=1.000, CPS 8.7–12.8 (within ±20%), no scene < 3 words, no clipping.
+
 ### What is still open
 
 - Cloudflare FLUX not tested (no `CF_ACCOUNT_ID`/`CF_API_TOKEN` set).

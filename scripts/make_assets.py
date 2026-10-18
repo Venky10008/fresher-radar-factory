@@ -476,10 +476,11 @@ def silence_path(gap):
     return path
 
 
-def finalize_scene(synth, out_path, atempo=1.0):
-    """Joins the phrases with short gaps, applies the speed correction and
-    loudness-normalizes the clip. Returns {"seconds", "words"} where words
-    are [{t, d, w}] in milliseconds on the FINAL timeline, or None.
+def finalize_scene(synth, out_path):
+    """Joins the phrases with short gaps and loudness-normalizes the clip.
+    No time-stretching: every clip plays at natural TTS speed (atempo=1.0).
+    Returns {"seconds", "words"} where words are [{t, d, w}] in milliseconds
+    on the FINAL timeline, or None.
     """
     pieces = synth["pieces"]
     gap = PHRASE_GAP_SECONDS
@@ -493,8 +494,8 @@ def finalize_scene(synth, out_path, atempo=1.0):
             for t_ms, d_ms, txt in w:
                 words_out.append(
                     {
-                        "t": int(round((offset_ms + t_ms) / atempo)),
-                        "d": int(round(d_ms / atempo)),
+                        "t": int(round(offset_ms + t_ms)),
+                        "d": int(round(d_ms)),
                         "w": txt,
                     }
                 )
@@ -510,10 +511,8 @@ def finalize_scene(synth, out_path, atempo=1.0):
     else:
         join_audio_with_gaps([p for p, _ in pieces], joined)
 
-    filters = []
-    if abs(atempo - 1.0) > 0.01:
-        filters.append(f"atempo={atempo:.4f}")
-    filters.append(VOICE_LOUDNESS)
+    # Natural TTS speed only — no atempo. Just loudness normalization.
+    filters = [VOICE_LOUDNESS]
     subprocess.run(
         [
             "ffmpeg", "-y", "-loglevel", "error",
@@ -707,6 +706,39 @@ def main():
     if from_field_count:
         log(f"voice_*_te fields used for {from_field_count}/{len(plan)} scenes (pure Telugu for the voice)")
 
+    # Merge scenes with fewer than 3 spoken words into the next scene so no
+    # clip is just 1-2 words. Full-stop pauses between phrases are preserved.
+    merged_plan = []
+    merged_voice = []
+    i = 0
+    while i < len(plan):
+        kind, text, label = plan[i]
+        vtext = voice_texts[i]
+        spoken = vtext.strip() if vtext and vtext.strip() else text
+        word_count = len(spoken.split())
+        if word_count < 3 and i + 1 < len(plan):
+            next_kind, next_text, next_label = plan[i + 1]
+            next_vtext = voice_texts[i + 1]
+            merged_text = (text + " " + next_text).strip()
+            if vtext and vtext.strip() and next_vtext and next_vtext.strip():
+                merged_vtext = (vtext.strip() + " " + next_vtext.strip())
+            elif vtext and vtext.strip():
+                merged_vtext = vtext.strip()
+            elif next_vtext and next_vtext.strip():
+                merged_vtext = next_vtext.strip()
+            else:
+                merged_vtext = ""
+            merged_plan.append((kind, merged_text, label))
+            merged_voice.append(merged_vtext)
+            log(f"merged scene {i} ({word_count} words) with scene {i+1} -> \"{merged_text[:60]}...\"")
+            i += 2
+        else:
+            merged_plan.append((kind, text, label))
+            merged_voice.append(vtext)
+            i += 1
+    plan = merged_plan
+    voice_texts = merged_voice
+
     # ----- voice -----
     log("== Voice-over ==")
     synths = []
@@ -747,18 +779,13 @@ def main():
             if fname != ".gitkeep":
                 os.remove(os.path.join("public/audio", fname))
     else:
-        # uniform speed: pull every clip toward the run's average speech rate
-        cps_values = [s["cps"] for s, _, _ in synths]
-        target_cps = sum(cps_values) / len(cps_values)
+        # No time-stretching: every clip plays at natural TTS speed (atempo=1.0).
         voice_engine = synths[0][0]["engine"]
         voiced = []
         for i, (s, tts_text, _from_field) in enumerate(synths):
-            atempo = 1.0
-            if len(synths) > 1 and s["cps"] > 0:
-                atempo = min(ATEMPO_MAX, max(ATEMPO_MIN, target_cps / s["cps"]))
             rel = f"audio/scene_{i}.mp3"
             full = os.path.join("public", rel)
-            res = finalize_scene(s, full, atempo)
+            res = finalize_scene(s, full)
             if res is None:
                 log(f"scene {i}: finalizing the clip failed")
                 voiced = None
@@ -771,7 +798,7 @@ def main():
             n_words = len(res["words"]) if res["words"] else 0
             log(
                 f"scene {i}: {res['seconds']:.2f}s engine={s['engine']} "
-                f"cps={s['cps']:.1f} atempo={atempo:.3f} word_timings={n_words} "
+                f"cps={s['cps']:.1f} atempo=1.000 word_timings={n_words} "
                 f"max_volume={max_vol:.1f} dB ({clip_status})"
             )
             voiced.append((rel, res["seconds"], res["words"]))
@@ -780,10 +807,7 @@ def main():
                 if fname != ".gitkeep":
                     os.remove(os.path.join("public/audio", fname))
         else:
-            log(
-                f"voice engine used: {voice_engine}; speech-rate target {target_cps:.1f} chars/s "
-                f"(every clip pulled toward it, range {ATEMPO_MIN}-{ATEMPO_MAX})"
-            )
+            log(f"voice engine used: {voice_engine}; every clip at natural TTS speed (atempo=1.0)")
 
 
     # ----- pictures -----
