@@ -1,5 +1,12 @@
 # PROJECT_STATE
 
+## Latest fix
+- Fixed SyntaxError at line 422 in scripts/make_assets.py (orphan fragment removed).
+- Simplified normalize_te to one Latin-word-only version; Telugu text and ZWNJ untouched.
+- Removed unused Telugu grapheme helpers and the unused unicodedata import.
+- music is on ("music": true in job.json).
+- GitHub Action now runs python -m py_compile scripts/make_assets.py first.
+
 ## Sphinx sample job - 5 fixes applied (scripts/make_assets.py)
 
 ### FIX 1 - Telugu ZWNJ text corruption protection

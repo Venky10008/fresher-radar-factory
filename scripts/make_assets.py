@@ -23,6 +23,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -281,15 +282,7 @@ TELUGU_WORDS = {
     "what": "వాట్",
 }
 
-_WORD_RE = re.compile(
-    r"\b(" + "|".join(sorted((re.escape(w) for w in TELUGU_WORDS), key=len, reverse=True)) + r")\b",
-    re.IGNORECASE,
-)
-
-
-def normalize_te(text):
-    """Replaces common English words with a Telugu spelling for the voice."""
-    return _WORD_RE.sub(lambda m: TELUGU_WORDS[m.group(0).lower()], (text or "").strip())
+_LATIN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9+\-#]*")
 
 
 def split_phrases(text):
@@ -321,105 +314,12 @@ VOICE_LOUDNESS = "loudnorm=I=-16:TP=-1.5:LRA=11"
 
 
 
-# FIX 1 - Telugu text corruption (ZWNJ). Rules that protect Telugu script:
-#   1. Split words ONLY on whitespace.
-#   2. Never split, drop or reorder Telugu combining marks
-#      (U+0C3E-U+0C4D Chandrakala..Nukta, U+0C55-U0C56, U+0C62-U0C63, ...) or
-#      U+200C / U+200D. No character-by-character operations on Telugu text.
-#   3. NFC only when it does not change the string (ZWNJ is always kept).
-#   4. English-word replacement (dictionary) must never touch Telugu-script
-#      grapheme clusters - the ZWNJ inside them would be lost.
-#   5. Assert that props.json text equals job input text and TTS text equals
-#      voice_*_te input (except intended phrase splitting).
-
-_TE_BASE = r"[ఀ-౿]"
-_TE_MARKS = r"(?:[ా-్ౕ-ౖౢ-ౣ‌‍]*[ఀ-౿]*)"
-def _te_graphemes(text):
-    """Yield Telugu grapheme clusters; whitespace and non-Telugu untouched."""
-    i = 0
-    n = len(text)
-    while i < n:
-        m = re.match(_TE_GRAPEM, text[i:])
-        if m:
-            yield m.group(0)
-            i += m.end()
-        else:
-            # whitespace or Latin: consume one char (safe)
-            if text[i].isspace():
-                yield text[i]  # noqa: E703
-                i += 1
-            else:
-                yield text[i]  # noqa: E703
-                i += 1
-
-
-def _nfc_safe(text):
-    """Return NFC(text) only when identical to input; else keep text as-is."""
-    if not text:
-        return text
-    n = unicodedata.normalize("NFC", text)
-    return n if n == text else text
-
+# FIX 1 - Telugu text corruption (ZWNJ). The dictionary only replaces Latin
+# words, so Telugu letters, combining marks and U+200C are never modified.
 
 def normalize_te(text):
-    """Replace Latin-only English words with Telugu spellings; never touch
-    Telugu-script grapheme clusters - ZWNJ is preserved (FIX 1)."""
-    text = (text or "")
-    # 1. Separate Telugu grapheme clusters from Latin words.
-    parts = []
-    for cluster, is_lat, is_ws in _split_te_latin_whitespace(text):
-        if is_ws:
-            parts.append(cluster)
-        elif is_lat:
-            parts.append(_replace_latin_words(cluster))
-        else:
-            parts.append(cluster)
-    # 2. NFC-normalise only if it does not change the string (preserves ZWNJ).
-    return _nfc_safe("".join(parts))
-
-
-def _split_te_latin_whitespace(text):
-    """Yield (token, is_latin, is_whitespace) - splits ONLY on whitespace.
-
-    Telugu grapheme clusters (base letter + combining marks + ZWNJ) are never
-    broken.  Latin words are matched greedily.  Everything else is kept as-is.
-    """
-    i = 0
-    n = len(text)
-    while i < n:
-        ch = text[i]
-        if ch.isspace():
-            j = i
-            while j < n and text[j].isspace():
-                j += 1
-            yield text[i:j], False, True
-            i = j
-            continue
-        if _TE_GRAPEM_START.search(ch):
-            m = re.match(_TE_GRAPEM, text[i:])
-            yield m.group(0), False, False
-            i += m.end()
-            continue
-        m = re.match(_LATIN_RE, text[i:])
-        if m:
-            yield m.group(0), True, False
-            i += m.end()
-            continue
-        yield text[i], False, False
-        i += 1
-
-
-_TE_GRAPEM_START = re.compile(r"[ఀ-౿]")
-_LATIN_RE = re.compile(r"[A-Za-z][A-Za-z0-9+\-#]*")
-
-
-def _replace_latin_words(text):
-    """Swap Latin words against TELUGU_WORDS; keep Telugu/ZWNJ untouched."""
-    return _WORD_RE.sub(lambda m: TELUGU_WORDS[m.group(0).lower()], text)
-
-
-    rf"(?:{_GRAPEM_CLUSTER})(?:\s+{_GRAPEM_CLUSTER})*"
-)
+    text = text or ""
+    return _LATIN_WORD_RE.sub(lambda m: TELUGU_WORDS.get(m.group(0).lower(), m.group(0)), text)
 
 
 def tts_edge(text, voice, rate, out_path):
@@ -540,6 +440,12 @@ def synth_phrases(tts_text, voice, rate):
         # only edge gives timings; if a later phrase fell back, drop them all
         if engine != "edge":
             words = None
+        # FIX 5: strip the silence edge-tts bakes in, then keep captions in
+        # sync by shifting each word earlier by the leading silence removed.
+        removed = trim_silence(piece)
+        if words is not None and removed > 0:
+            shift = removed * 1000.0
+            words = [(max(0.0, t - shift), d, txt) for (t, d, txt) in words]
         pieces.append((piece, words))
     speech_chars = len(re.sub(r"\s+", "", tts_text)) or 1
     speech_time = sum(audio_seconds(p) for p, _ in pieces) or 0.001
@@ -568,6 +474,145 @@ def check_clipping(path):
     except Exception:  # noqa: BLE001
         pass
     return None
+
+
+def detect_silences(path, noise_db=-45):
+    """Return [(start_s, dur_s)] of silent runs found by ffmpeg silencedetect."""
+    try:
+        out = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-i", path,
+                "-af", f"silencedetect=noise={noise_db}dB:d=0.05",
+                "-f", "null", "-",
+            ],
+            capture_output=True, text=True, check=True,
+        )
+    except Exception:  # noqa: BLE001
+        return []
+    starts, silences = [], []
+    for line in out.stderr.splitlines():
+        if "silence_start:" in line:
+            try:
+                starts.append(float(line.split("silence_start:")[1].split()[0]))
+            except (ValueError, IndexError):
+                pass
+        elif "silence_end:" in line:
+            try:
+                end = float(line.split("silence_end:")[1].split("|")[0].strip())
+                dur = float(line.split("silence_duration:")[1].split()[0])
+                start = starts.pop(0) if starts else max(0.0, end - dur)
+                silences.append((start, dur))
+            except (ValueError, IndexError):
+                pass
+    return silences
+
+
+def trim_silence(path, noise_db=-45, keep=0.05):
+    """FIX 5: strip the leading & trailing silence edge-tts bakes into a phrase.
+
+    edge-tts pads every phrase with ~0.19 s of leading and ~1.0 s of trailing
+    silence; between phrases that becomes the dead air the old 0.42 s gap only
+    widened (measured 1.39 s inside one scene). Trimming leaves `keep` s of
+    margin at each end so soft onsets are not clipped, and returns how much
+    LEADING silence was removed so the caller can shift word timings to stay
+    in sync with the trimmed audio. At tempo is unaffected (no time stretch).
+    """
+
+    def _leading():
+        d = detect_silences(path, noise_db)
+        return (d[0][0] + d[0][1]) if (d and d[0][0] <= 0.05) else 0.0
+
+    lead_before = _leading()
+    tmp = path + ".trim.mp3"
+    # areverse trick: drop leading silence, flip, drop (now leading) trailing
+    # silence, flip back — keeps internal pauses between words intact.
+    af = (
+        f"silenceremove=start_periods=1:start_silence={keep}:start_threshold={noise_db}dB,"
+        "areverse,"
+        f"silenceremove=start_periods=1:start_silence={keep}:start_threshold={noise_db}dB,"
+        "areverse"
+    )
+    r = subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error", "-i", path,
+            "-af", af, "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "160k", tmp,
+        ],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) < 500:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return 0.0  # keep the original if trimming failed
+    if audio_seconds(tmp) < 0.05:
+        os.remove(tmp)
+        return 0.0  # would have removed all speech; keep the original
+    lead_after = 0.0
+    d = detect_silences(tmp, noise_db)
+    if d and d[0][0] <= 0.05:
+        lead_after = d[0][0] + d[0][1]
+    os.replace(tmp, path)
+    return max(0.0, lead_before - lead_after)
+
+
+def print_gap_report(scenes, fps=FPS, target=0.6, noise_db=-45):
+    """FIX 5: print every measured gap between voice segments.
+
+    In-scene phrase gaps come from silencedetect on each clip; the gap
+    between two scenes is the trailing silence of scene i (its frame length
+    minus where the voice really stops) plus any leading silence of scene
+    i+1. Target: every gap <= 0.6 s (the CTA end may be longer).
+    """
+    log("== Voice gap report (FIX 5) ==")
+    if not any(s.get("audio") for s in scenes):
+        log("  no voice clips - nothing to measure")
+        return
+    ends, starts = {}, {}
+    worst, worst_at = 0.0, "-"
+    for i, s in enumerate(scenes):
+        audio = s.get("audio")
+        if not audio:
+            continue
+        clip = os.path.join("public", audio)
+        clip_len = audio_seconds(clip)
+        scene_len = s["frames"] / fps
+        sil = detect_silences(clip, noise_db)
+        intra = [(st, du) for st, du in sil if st + du < clip_len - 0.03]
+        for st, du in intra:
+            status = "OK" if du <= target else "TOO LONG"
+            log(f"  scene {i}: phrase gap {du:.2f}s at {st:.2f}s [{status}]")
+            if du > worst:
+                worst, worst_at = du, f"scene {i} in-clip"
+        end_voice = clip_len
+        for st, du in sil:
+            if st + du >= clip_len - 0.03:
+                end_voice = st
+        lead = 0.0
+        for st, du in sil:
+            if st <= 0.03:
+                lead = st + du
+                break
+        ends[i], starts[i] = end_voice, lead
+        log(
+            f"  scene {i}: voice {clip_len:.2f}s in {scene_len:.2f}s scene, "
+            f"trailing gap {scene_len - end_voice:.2f}s"
+        )
+        tw = scene_len - end_voice
+        # the CTA's end pad (1.4 s) is intentionally longer — prompt allows it
+        if tw > worst and s.get("kind") != "cta":
+            worst, worst_at = tw, f"scene {i} trailing"
+    for i in sorted(ends):
+        if i + 1 in starts:
+            gap = (scenes[i]["frames"] / fps - ends[i]) + starts[i + 1]
+            is_cta_end = scenes[i + 1].get("kind") == "cta"
+            status = "OK" if gap <= target or is_cta_end else "TOO LONG"
+            log(
+                f"  gap scene {i}->scene {i + 1} = {gap:.2f}s "
+                f"(target <= {target:.1f}s){' [CTA exempt]' if is_cta_end else ''} [{status}]"
+            )
+            if gap > worst and not is_cta_end:
+                worst, worst_at = gap, f"scene {i}->{i + 1}"
+    verdict = "PASS" if worst <= target else "FAIL"
+    log(f"  worst gap: {worst:.2f}s at {worst_at} (target <= {target:.1f}s) [{verdict}]")
 
 
 def silence_path(gap):
@@ -648,13 +693,82 @@ _TELUGU_RE = re.compile(r"[\u0c00-\u0c7f\u200c\u200d]+")
 
 
 def _sanitize_prompt(prompt):
-    \"\"\"Replace Telugu-script runs with English placeholders; otherwise keep
-    the prompt intact.\"\"\"
+    """Replace Telugu-script runs with English placeholders; otherwise keep
+    the prompt intact."""
     return _TELUGU_RE.sub("[Telugu script]", str(prompt or ""))
 
 
+# FIX 2: words that push FLUX into drawing fake text/screens. Every prompt
+# containing one gets that phrase replaced with a neutral object, and the
+# strict no-text suffix below is appended to EVERY picture prompt.
+BANNED_PHRASES = [
+    "whiteboard", "dashboard", "checklist", "interface",
+    "screen", "monitor", "display", "diagram", "chart",
+    "poster", "document", "sign", "book", "quiz", "laptop", "code", "ui",
+]
+_NEUTRAL_OBJECTS = [
+    "glowing abstract shapes",
+    "floating geometric icons",
+    "futuristic desk lamp",
+    "soft glowing orbs",
+    "abstract flowing ribbons",
+]
+NO_TEXT_SUFFIX = (
+    ", no text, no letters, no words, no numbers, no captions, no signs, "
+    "no logos, no watermark, no user interface, no screens with writing, "
+    "no code on screen"
+)
+# FIX 3: camera angles used to derive fresh prompts when the job has fewer
+# prompts than picture scenes.
+_CAMERA_ANGLES = [
+    "close-up of", "wide shot of", "top view of", "low angle view of",
+    "over-the-shoulder view of", "side profile view of",
+]
+
+
+def _strip_banned_words(prompt):
+    """Replace screen/code/diagram/... phrases with neutral objects (FIX 2)."""
+    out = str(prompt or "")
+    for i, word in enumerate(sorted(BANNED_PHRASES, key=len, reverse=True)):
+        pattern = rf"\b{re.escape(word)}s?\b"
+        if re.search(pattern, out, re.IGNORECASE):
+            out = re.sub(
+                pattern,
+                _NEUTRAL_OBJECTS[i % len(_NEUTRAL_OBJECTS)],
+                out,
+                flags=re.IGNORECASE,
+            )
+    return out
+
+
+def build_picture_prompt(base_prompt, style):
+    """FIX 2: sanitize -> replace banned words -> append no-text suffix."""
+    cleaned = _strip_banned_words(_sanitize_prompt(base_prompt))
+    return f"{cleaned}, {style}{NO_TEXT_SUFFIX}"
+
+
+def _ocr_letters(path):
+    """FIX 2: OCR the generated picture with tesseract (when installed).
+
+    Returns (available, letters, sample). available is False when
+    tesseract is missing - the caller then skips the redraw step.
+    """
+    if not shutil.which("tesseract"):
+        return False, 0, ""
+    try:
+        out = subprocess.run(
+            ["tesseract", path, "stdout"],
+            capture_output=True, text=True, timeout=90,
+        )
+        text = " ".join((out.stdout or "").split())
+        return True, len(re.findall(r"[A-Za-z]", text)), text[:80]
+    except Exception as exc:  # noqa: BLE001
+        log(f"  OCR run failed: {type(exc).__name__}: {exc}")
+        return True, 0, ""
+
+
 def _unique_prompts(prompts, count):
-    \"\"\"Yield `count` unique variants of the prompt list (FIX 3).\"\"\"
+    """Yield `count` unique variants of the prompt list (FIX 3)."""
     base = [str(p).strip() for p in prompts if str(p).strip()]
     if not base:
         return
@@ -752,10 +866,14 @@ def make_sfx(out_path):
 
 # ---------------- music ----------------
 def make_music(seconds, root, out_path):
-    """A soft, slow pad: open chord, gentle tremolo, low-pass and echo. No download needed.
-    FIX 4: ensure minimum duration of 5 seconds so fade-in/out filters work properly.
+    """A soft, slow pad: open chord, gentle tremolo, low-pass and echo.
+
+    FIX 4: music is ON by default; fade in 0.5 s and fade out 1 s; the file is
+    measured with volumedetect and scaled so its peak sits at -28 dB — the
+    templates play music at a fixed volume, so this is the "simple volume"
+    duck that keeps music ~28 dB under the voice while the gaps between
+    phrases are no longer digital silence. Minimum 5 s so the fades work.
     """
-    # Ensure minimum duration for proper fade-in/fade-out handling
     safe_seconds = max(seconds, 5.0)
     ratios = [1.0, 1.5, 2.0, 2.25, 3.0]
     d = f"{safe_seconds:.2f}"
@@ -763,16 +881,40 @@ def make_music(seconds, root, out_path):
     for r in ratios:
         cmd += ["-f", "lavfi", "-i", f"sine=f={root * r:.2f}:d={d}"]
 
-    # Fade in 2s, fade out from the last 2.5s (or start earlier if clip is short)
-    fade_out_start = max(2.0, safe_seconds - 2.5)
+    fade_out_start = safe_seconds - 1.0
     graph = (
         "[0][1][2][3][4]amix=inputs=5:normalize=0,volume=0.30,"
         "tremolo=f=0.18:d=0.35,lowpass=f=1100,"
         "aecho=0.8:0.6:90|180:0.35|0.22,"
-        f"afade=t=in:d=2,afade=t=out:st={fade_out_start:.2f}:d=2.5"
+        f"afade=t=in:d=0.5,afade=t=out:st={fade_out_start:.2f}:d=1.0"
     )
     cmd += ["-filter_complex", graph, "-ar", "44100", "-b:a", "128k", out_path]
-    subprocess.run(cmd, check=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        tail = (proc.stderr or "").strip()[-500:]
+        log(f"music ffmpeg failed (exit {proc.returncode}): {tail}")
+        raise RuntimeError(f"ffmpeg music generation failed: {tail}")
+    peak = check_clipping(out_path)
+    if peak is None:
+        raise RuntimeError("could not measure the generated music (volumedetect failed)")
+    delta = -28.0 - peak
+    if abs(delta) > 0.3:
+        tmp = out_path + ".lvl.mp3"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", out_path,
+                "-af", f"volume={delta:.2f}dB",
+                "-b:a", "128k", tmp,
+            ],
+            check=True,
+        )
+        os.replace(tmp, out_path)
+        peak = check_clipping(out_path)
+    log(
+        f"music pad {safe_seconds:.1f}s, fade-in 0.5s, fade-out 1s, "
+        f"max_volume={peak:.1f} dB (target -28 dB under the voice)"
+    )
 
 
 def main():
@@ -782,6 +924,8 @@ def main():
     voice = job.get("voice") or VOICE_DEFAULT
     rate = job.get("rate") or RATE_DEFAULT
     want_music = job.get("music", True)
+    if "music" in job and not job["music"]:
+        log('music=off: job JSON sets "music": false - music is ON by default when the field is omitted')
     want_sfx = job.get("sfx", True)
 
     for d in ("public/audio", "public/images"):
@@ -805,6 +949,10 @@ def main():
     if len(plan) < 2:
         log("ERROR: job needs at least hook_te or summary_te")
         sys.exit(1)
+
+    # FIX 1: remember the exact input text per scene; asserted against
+    # the final props.json after it is written.
+    input_texts = [t for _k, t, _l in plan]
 
     # ----- which text the voice speaks -----
     # Optional pure-Telugu fields (voice_hook_te / voice_summary_te /
@@ -903,6 +1051,39 @@ def main():
             else:
                 log(f"scene {i} ({kind}) dictionary fallback — text is pure Telugu script")
         log(f"  text sent to TTS: {tts_text}")
+        # FIX 1: assertions — voice_*_te input must reach TTS verbatim and
+        # the dictionary fallback must never change Telugu marks or ZWNJ.
+        if from_field:
+            assert tts_text == (voice_texts[i] or "").strip(), \
+                "FIX 1: TTS text must equal the voice_*_te input"
+        else:
+            # FIX 1: normalize_te only replaces Latin words with Telugu
+            # spellings. That can ADD Telugu marks/ZWNJ (e.g. "updates" ->
+            # "అప్‌డేట్స్") but must never DROP marks already in the input.
+            # Pure-Telugu input has nothing to replace -> byte-identical.
+            zwnj = "\u200c"
+
+            def _marks(s):
+                return sum(
+                    1
+                    for c in s
+                    if ("\u0c3e" <= c <= "\u0c4d")
+                    or ("\u0c55" <= c <= "\u0c56")
+                    or ("\u0c62" <= c <= "\u0c63")
+                )
+
+            assert tts_text.count(zwnj) >= text.count(zwnj), \
+                "FIX 1: normalize_te dropped a ZWNJ from the input"
+            assert _marks(tts_text) >= _marks(text), \
+                "FIX 1: normalize_te dropped a Telugu combining mark"
+            if not LATIN_RE.search(text):
+                assert tts_text == text, \
+                    "FIX 1: normalize_te altered pure-Telugu input text"
+        _test_word = ("\u0c2a\u0c4d\u0c30\u0c3e\u0c1c\u0c46\u0c15\u0c4d\u0c1f\u0c4d"
+                      "\u200c\u0c32\u0c4b")  # test word with ZWNJ
+        if _test_word in tts_text:
+            log(f"  FIX 1 test word OK in TTS text: {_test_word}"
+                f" codepoints={[hex(ord(c)) for c in _test_word]}")
         s = synth_phrases(tts_text, voice, rate)
         if s is None:
             synths = None
@@ -960,37 +1141,101 @@ def main():
     if not raw_prompts:
         raw_prompts = list(cat["images"])
         log("no image_prompts in the job, using generic prompts for this category")
-    # FIX 2: sanitize Telugu script so it does not garble AI images.
-    prompts = [_sanitize_prompt(p) for p in raw_prompts]
-    # FIX 3: give every scene a unique prompt variation (no repeats).
     n = len(plan) - sum(1 for k, _, _ in plan if k == "cta")
-    prompt_variants = [(p, i) for i, p in enumerate(prompts)]
-    if len(prompt_variants) < n:
-        # pad with variants of the last one if we have fewer than scenes
-        last = prompt_variants[-1][0] if prompt_variants else cat["images"][0]
-        prompt_variants += [(last + f" (scene {i})", i) for i in range(len(prompt_variants), n)]
-    img_prompt_kwargs = {}
     style = (
         f"{cat['style']} color palette, modern clean illustration, soft lighting, "
-        "no text, no letters, no logos, no watermark, no real people's faces"
+        "no real people's faces"
     )
+    # FIX 3: never reuse a prompt across scenes. With fewer base prompts
+    # than picture scenes, derive extras by changing the camera angle.
+    base_for_scene = []
+    for scene_i in range(n):
+        if scene_i < len(raw_prompts):
+            base_for_scene.append((str(raw_prompts[scene_i]).strip(), scene_i))
+        else:
+            angle = _CAMERA_ANGLES[(scene_i - len(raw_prompts)) % len(_CAMERA_ANGLES)]
+            src_p = str(raw_prompts[scene_i % len(raw_prompts)]).strip()
+            base_for_scene.append((f"{angle} {src_p}", scene_i % len(raw_prompts)))
     images = []
+    used_prompts = set()
+    file_meta = {}
     for scene_i, (kind, text, label) in enumerate(plan):
         if kind == "cta":
             images.append(None)
             continue
-        base_prompt, orig_idx = prompt_variants[scene_i]
-        # FIX 3: add scene-specific suffix so the same base prompt becomes
-        # a unique image per scene.
-        prompt = f"{base_prompt}, {style}, scene {scene_i + 1} of {n}"
+        base_prompt, orig_idx = base_for_scene[scene_i]
+        # FIX 2: replace banned words and append the strict no-text suffix.
+        prompt = build_picture_prompt(base_prompt, style)
+        for attempt in range(12):
+            if prompt not in used_prompts:
+                break
+            angle = _CAMERA_ANGLES[attempt % len(_CAMERA_ANGLES)]
+            prompt = build_picture_prompt(f"{angle} {base_prompt}", style)
+        used_prompts.add(prompt)
+        seed_i = seed + scene_i
         rel = f"images/scene_{scene_i}.jpg"
-        engine = make_image(prompt, seed + scene_i, os.path.join("public", rel))
+        full = os.path.join("public", rel)
+        log(f"scene {scene_i}: seed={seed_i} prompt={prompt}")
+        engine = make_image(prompt, seed_i, full)
+        file_meta[rel] = (prompt, seed_i, engine)
+        # FIX 2: OCR the picture; if tesseract finds 3+ letters of fake
+        # text, redraw ONCE with a new seed and a stricter prompt.
+        if engine and os.path.exists(full):
+            ocr_ok, letters, sample = _ocr_letters(full)
+            if not ocr_ok:
+                log(f"scene {scene_i}: OCR skipped (tesseract not installed)")
+            elif letters >= 3:
+                strict = (
+                    prompt
+                    + ", extremely plain flat vector illustration, "
+                    + "absolutely no written characters anywhere"
+                )
+                seed_i = seed_i + 977
+                log(
+                    f"scene {scene_i}: OCR found {letters} letters "
+                    f"({sample!r}) -> regenerating once with seed {seed_i}"
+                )
+                new_engine = make_image(strict, seed_i, full)
+                if new_engine:
+                    engine = new_engine
+                    used_prompts.add(strict)
+                    file_meta[rel] = (strict, seed_i, engine)
+                else:
+                    log(f"scene {scene_i}: regeneration failed, keeping the first picture")
+            else:
+                log(f"scene {scene_i}: OCR clean ({letters} letters)")
         if engine:
-            log(f"scene {scene_i}: picture from {engine} (prompt source: idx {orig_idx})")
+            log(f"scene {scene_i}: picture from {engine} (base prompt idx {orig_idx})")
             images.append(rel)
         else:
             log(f"scene {scene_i}: no picture, a motion graphic will be drawn")
             images.append(None)
+    # FIX 3: two scenes must never share the same picture file (hash check).
+    seen_hashes = {}
+    for rel, (mprompt, _mseed, _mengine) in list(file_meta.items()):
+        full = os.path.join("public", rel)
+        if not os.path.exists(full):
+            continue
+        with open(full, "rb") as fh:
+            digest = hashlib.md5(fh.read()).hexdigest()
+        if digest in seen_hashes:
+            other = seen_hashes[digest]
+            new_seed = seed + 4000 + len(seen_hashes)
+            retry = mprompt + ", different composition and perspective"
+            log(
+                f"FIX 3: {rel} is byte-identical to {other} -> "
+                f"regenerating with seed {new_seed}"
+            )
+            new_engine = make_image(retry, new_seed, full)
+            if new_engine:
+                file_meta[rel] = (retry, new_seed, new_engine)
+                with open(full, "rb") as fh:
+                    digest = hashlib.md5(fh.read()).hexdigest()
+                log(f"FIX 3: {rel} regenerated from {new_engine} (seed {new_seed})")
+        if digest not in seen_hashes:
+            seen_hashes[digest] = rel
+        else:
+            log(f"FIX 3 WARNING: {rel} still identical to {seen_hashes[digest]}")
 
     # ----- timing -----
     scenes = []
@@ -1002,7 +1247,7 @@ def main():
         else:
             audio_rel = None
             seconds = min(9.0, max(2.8, len(text) * 0.075))
-        pad = 1.4 if kind == "cta" else 0.6
+        pad = 1.4 if kind == "cta" else SCENE_PAD
         frames = int(math.ceil((seconds + pad) * FPS))
         scene = {"kind": kind, "text": text, "label": label, "audio": audio_rel, "image": images[i], "frames": frames}
         # optional fields (only present when the voice pipeline produced them,
@@ -1015,13 +1260,15 @@ def main():
 
     total = sum(s["frames"] for s in scenes) / FPS
 
+    print_gap_report(scenes)
+
     # ----- music -----
     music_rel = None
     if want_music:
         try:
             make_music(total + 1.0, cat["root"], "public/music.mp3")
             music_rel = "music.mp3"
-            log("== Music == background pad created")
+            log("music=on: ffmpeg pad written to public/music.mp3")
         except Exception as exc:  # noqa: BLE001
             log(f"WARNING: music failed ({exc}). Continuing without music.")
 
@@ -1054,6 +1301,22 @@ def main():
     }
     with open("public/props.json", "w", encoding="utf-8") as f:
         json.dump(props, f, ensure_ascii=False, indent=2)
+
+    # FIX 1: for every field, the text in props.json must equal the job
+    # input text (merged scenes are single-space joins of two inputs).
+    with open("public/props.json", "r", encoding="utf-8") as f:
+        check_props = json.load(f)
+    valid_texts = set(input_texts)
+    valid_texts.update(
+        f"{input_texts[k]} {input_texts[k + 1]}" for k in range(len(input_texts) - 1)
+    )
+    for sc in check_props["scenes"]:
+        assert sc["text"] in valid_texts, \
+            f"FIX 1: props.json text not from the job input: {sc['text']!r}"
+    log(
+        f"FIX 1 assertion PASS: {len(check_props['scenes'])} scene texts in "
+        "props.json equal the job input"
+    )
 
     got_images = sum(1 for s in scenes if s["image"])
     log(

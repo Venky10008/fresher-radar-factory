@@ -38,6 +38,13 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Check make_assets.py syntax
+        run: |
+          python -m py_compile scripts/make_assets.py || {
+            echo "::error::scripts/make_assets.py has a SyntaxError - fix it before rendering"
+            exit 1
+          }
+
       - name: Install Chrome libraries
         run: |
           sudo apt-get update
