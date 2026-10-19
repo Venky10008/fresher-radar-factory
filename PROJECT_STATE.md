@@ -41,3 +41,6 @@
 
 ## Voice A/B test
 - voice A/B test: edge variants vs Piper te_IN-padmavathi-medium (CC-BY-4.0, credit required). Decision pending listening test.
+
+## Voice generation profiles
+- edge-tts profiles per scene kind, single call per scene, VOICE_PRESET single|mix, Piper not used.

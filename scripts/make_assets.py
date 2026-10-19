@@ -5,11 +5,13 @@ Prepares everything Remotion needs for one reel:
        the same sentences in PURE Telugu script (English words spelled phonetically).
        When present the voice reads these; the screen still shows the normal text.
        When missing, normalize_te() + the ~90-word dictionary is used as before.
-     - edge-tts word boundaries (boundary="WordBoundary") become scene.words in
-       props.json, so captions reveal word-by-word with the voice.
-     - Every clip is speed-pulled toward the run's average speech rate and
-       loudness-normalized (loudnorm -16 LUFS / -1.5 dBTP), so speed and level
-       are uniform across scenes.
+      - Each scene is ONE edge-tts call for the whole text (no phrase splitting,
+        no inserted silence, no atempo). Word boundaries (boundary="WordBoundary")
+        become scene.words in props.json.
+      - Voice settings come from VOICE_PROFILES (env VOICE_PRESET=single|mix,
+        default single): a voice/rate/pitch per scene kind (hook/features/cta).
+      - Every clip is trimmed and loudness-normalized (loudnorm -16 LUFS /
+        -1.5 dBTP).
   2. One picture per scene from the image prompts (Cloudflare FLUX, then Pollinations; a motion graphic is drawn if both fail)
   3. A soft background music pad (made with ffmpeg, no download needed)
   4. A subtle transition whoosh (sfx, ffmpeg) — disable with job "sfx": false
@@ -295,6 +297,44 @@ def split_phrases(text):
 
 
 # ---------------- voice ----------------
+VOICE_PROFILES = {
+    "mix": {
+        "hook":     {"voice": "te-IN-MohanNeural",  "rate": "-5%", "pitch": "+0Hz"},
+        "features": {"voice": "te-IN-ShrutiNeural", "rate": "-5%", "pitch": "+3Hz"},
+        "cta":      {"voice": "te-IN-ShrutiNeural", "rate": "-8%", "pitch": "+0Hz"},
+    },
+    "single": {
+        "hook":     {"voice": "te-IN-ShrutiNeural", "rate": "-5%", "pitch": "+3Hz"},
+        "features": {"voice": "te-IN-ShrutiNeural", "rate": "-5%", "pitch": "+3Hz"},
+        "cta":      {"voice": "te-IN-ShrutiNeural", "rate": "-8%", "pitch": "+0Hz"},
+    },
+}
+VOICE_PRESET_DEFAULT = "single"
+SCENE_VOICE_SLOT = {"hook": "hook", "line": "features", "students": "features", "cta": "cta"}
+
+
+def get_voice_preset():
+    preset = (os.environ.get("VOICE_PRESET") or VOICE_PRESET_DEFAULT).strip().lower()
+    if preset not in VOICE_PROFILES:
+        log(f"WARNING: unknown VOICE_PRESET '{preset}', using '{VOICE_PRESET_DEFAULT}'")
+        preset = VOICE_PRESET_DEFAULT
+    return preset
+
+
+def profile_for_scene(kind, preset=None, voice_override=None, rate_override=None):
+    """Resolve voice/rate/pitch for a scene kind; job voice/rate override the profile."""
+    preset = preset or get_voice_preset()
+    slot = SCENE_VOICE_SLOT.get(kind, "features")
+    profile = VOICE_PROFILES[preset][slot]
+    return {
+        "preset": preset,
+        "slot": slot,
+        "voice": voice_override or profile["voice"],
+        "rate": rate_override or profile["rate"],
+        "pitch": profile["pitch"],
+    }
+
+
 # Words the voice reads badly are either pre-translated (voice_*_te fields in
 # the job, pure Telugu script) or replaced with a Telugu spelling from the
 # dictionary below. Anything left in Latin script is reported in the log so a
@@ -322,7 +362,7 @@ def normalize_te(text):
     return _LATIN_WORD_RE.sub(lambda m: TELUGU_WORDS.get(m.group(0).lower(), m.group(0)), text)
 
 
-def tts_edge(text, voice, rate, out_path):
+def tts_edge(text, voice, rate, out_path, pitch="+0Hz"):
     """Synthesizes with edge-tts and returns word boundaries.
 
     Returns [(t_ms, d_ms, word), ...]. edge-tts only sends WordBoundary
@@ -332,7 +372,7 @@ def tts_edge(text, voice, rate, out_path):
     import edge_tts
 
     async def run():
-        com = edge_tts.Communicate(text, voice, rate=rate, boundary="WordBoundary")
+        com = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch, boundary="WordBoundary")
         words = []
         with open(out_path, "wb") as f:
             async for chunk in com.stream():
@@ -400,12 +440,11 @@ def join_audio_with_gaps(pieces, out_path, gap=PHRASE_GAP_SECONDS):
 
 
 def synth_phrases(tts_text, voice, rate):
-    """Synthesizes one scene phrase by phrase (short pauses between phrases).
+    """LEGACY (not used by the pipeline): synthesizes a scene phrase by phrase.
 
+    Kept for older test scripts; the pipeline now uses synth_scene().
     Returns {"pieces": [(path, words|None)], "cps": float, "engine": name}
     or None when every engine failed.
-    cps = characters per second of actual speech (gaps excluded) — used to
-    bring every clip in the run to the same speaking speed.
     """
     phrases = split_phrases(tts_text)
     workdir = tempfile.mkdtemp(prefix="tts_")
@@ -453,6 +492,58 @@ def synth_phrases(tts_text, voice, rate):
         "pieces": pieces,
         "cps": speech_chars / speech_time,
         "engine": scene_engine,
+    }
+
+
+def synth_scene(text, voice, rate, pitch):
+    """Synthesizes the whole scene text with ONE edge-tts call.
+
+    No phrase splitting, no inserted silence. gTTS stays the fallback.
+    Trims leading/trailing silence and shifts word timings to match.
+    Returns {"pieces": [(path, words|None)], "cps": float, "engine": name}
+    or None when every engine failed.
+    """
+    workdir = tempfile.mkdtemp(prefix="tts_")
+    piece = os.path.join(workdir, "scene.mp3")
+    engine = None
+    words = None
+    for name in TTS_ORDER:
+        fn = ENGINES.get(name)
+        if not fn:
+            continue
+        for attempt in (1, 2):
+            words = None
+            try:
+                if os.path.exists(piece):
+                    os.remove(piece)
+                if name == "edge":
+                    words = fn(text, voice, rate, piece, pitch=pitch)
+                else:
+                    words = fn(text, voice, rate, piece)
+                if os.path.exists(piece) and os.path.getsize(piece) > 1000:
+                    audio_seconds(piece)
+                    engine = name
+                    break
+                raise RuntimeError("audio piece is empty")
+            except Exception as exc:  # noqa: BLE001
+                log(f"  voice engine '{name}' attempt {attempt} failed: {type(exc).__name__}: {exc}")
+                time.sleep(2)
+        if engine:
+            break
+    if not engine:
+        return None
+    if engine != "edge":
+        words = None
+    removed = trim_silence(piece)
+    if words is not None and removed > 0:
+        shift = removed * 1000.0
+        words = [(max(0.0, t - shift), d, txt) for (t, d, txt) in words]
+    speech_chars = len(re.sub(r"\s+", "", text)) or 1
+    speech_time = audio_seconds(piece) or 0.001
+    return {
+        "pieces": [(piece, words)],
+        "cps": speech_chars / speech_time,
+        "engine": engine,
     }
 
 
@@ -921,8 +1012,9 @@ def main():
     job = load_job()
     category = job.get("category") or "ai_tools"
     cat = CATEGORY.get(category, CATEGORY["ai_tools"])
-    voice = job.get("voice") or VOICE_DEFAULT
-    rate = job.get("rate") or RATE_DEFAULT
+    preset = get_voice_preset()
+    voice_override = job.get("voice")
+    rate_override = job.get("rate")
     want_music = job.get("music", True)
     if "music" in job and not job["music"]:
         log('music=off: job JSON sets "music": false - music is ON by default when the field is omitted')
@@ -1026,6 +1118,11 @@ def main():
 
     # ----- voice -----
     log("== Voice-over ==")
+    log(f"voice preset: {preset} (env VOICE_PRESET; presets: single|mix)")
+    if voice_override:
+        log(f"job voice override: {voice_override}")
+    if rate_override:
+        log(f"job rate override: {rate_override}")
     synths = []
     for i, (kind, text, _label) in enumerate(plan):
         tts_text = (voice_texts[i] or "").strip() or normalize_te(text)
@@ -1084,11 +1181,12 @@ def main():
         if _test_word in tts_text:
             log(f"  FIX 1 test word OK in TTS text: {_test_word}"
                 f" codepoints={[hex(ord(c)) for c in _test_word]}")
-        s = synth_phrases(tts_text, voice, rate)
+        settings = profile_for_scene(kind, preset, voice_override, rate_override)
+        s = synth_scene(tts_text, settings["voice"], settings["rate"], settings["pitch"])
         if s is None:
             synths = None
             break
-        synths.append((s, tts_text, from_field))
+        synths.append((s, tts_text, from_field, settings))
 
     voiced = None
     if synths is None:
@@ -1100,7 +1198,7 @@ def main():
         # No time-stretching: every clip plays at natural TTS speed (atempo=1.0).
         voice_engine = synths[0][0]["engine"]
         voiced = []
-        for i, (s, tts_text, _from_field) in enumerate(synths):
+        for i, (s, tts_text, _from_field, settings) in enumerate(synths):
             rel = f"audio/scene_{i}.mp3"
             full = os.path.join("public", rel)
             res = finalize_scene(s, full)
@@ -1113,11 +1211,14 @@ def main():
             clip_status = "OK" if max_vol is not None and max_vol < 0 else (
                 "CLIPPING!" if max_vol is not None else "unknown"
             )
-            n_words = len(res["words"]) if res["words"] else 0
+            kind = plan[i][0]
+            long_silences = sum(1 for _st, dur in detect_silences(full, -45) if dur > 0.3)
+            mv_txt = f"{max_vol:.1f} dB" if max_vol is not None else "n/a"
             log(
-                f"scene {i}: {res['seconds']:.2f}s engine={s['engine']} "
-                f"cps={s['cps']:.1f} atempo=1.000 word_timings={n_words} "
-                f"max_volume={max_vol:.1f} dB ({clip_status})"
+                f"scene {i} ({kind}) preset={settings['preset']} "
+                f"voice={settings['voice']} rate={settings['rate']} pitch={settings['pitch']} "
+                f"seconds={res['seconds']:.2f} silences>0.3s={long_silences} "
+                f"max_volume={mv_txt} ({clip_status}) engine={s['engine']}"
             )
             voiced.append((rel, res["seconds"], res["words"]))
         if voiced is None:
