@@ -38,3 +38,6 @@
 - Pollinations returns HTTP 402 - motion graphics used as fallback.
 - src/ and src-v2/ templates were NOT touched.
 - Real MP4 render not re-run.
+
+## Voice A/B test
+- voice A/B test: edge variants vs Piper te_IN-padmavathi-medium (CC-BY-4.0, credit required). Decision pending listening test.
