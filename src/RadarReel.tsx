@@ -73,10 +73,10 @@ export const RadarReel: React.FC<ReelProps> = (props) => {
           return (
             <Sequence key={i} from={starts[i]} durationInFrames={scene.frames}>
               {scene.audio ? <Audio src={staticFile(scene.audio)} /> : null}
-              {i > 0 && props.sfx ? <Audio src={staticFile(props.sfx)} volume={0.35} /> : null}
-              {props.sfxPop ? <Audio src={staticFile(props.sfxPop)} volume={0.3} /> : null}
+              {i > 0 && props.sfx ? <Audio src={staticFile(props.sfx)} volume={0.6} /> : null}
+              {props.sfxPop ? <Audio src={staticFile(props.sfxPop)} volume={0.6} /> : null}
               {scene.kind === "cta" && props.sfxDing ? (
-                <Audio src={staticFile(props.sfxDing)} volume={0.3} />
+                <Audio src={staticFile(props.sfxDing)} volume={0.6} />
               ) : null}
               <SceneView scene={scene} lineIndex={lineIndex} props={props} theme={theme} variant={variant} />
             </Sequence>

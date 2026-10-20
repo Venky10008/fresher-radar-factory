@@ -948,10 +948,18 @@ SFX_SPECS = {
         "afade=t=out:st=0.05:d=0.65,volume=0.7",
     ),
 }
+# every sfx file is scaled to this measured peak (dB) after generation, so
+# the template volumes below map to one predictable in-mix level
+SFX_PEAK_DB = -6.0
 
 
 def make_sfx_files():
-    """Generate the three SFX (whoosh, pop, ding) with ffmpeg."""
+    """Generate the three SFX (whoosh, pop, ding) with ffmpeg.
+
+    Each file is then scaled to SFX_PEAK_DB (default -6 dB) so every effect
+    starts from the same measured level; the templates play them at a fixed
+    volume below the voice.
+    """
     for name, (source, af) in SFX_SPECS.items():
         out_path = os.path.join("public", name)
         subprocess.run(
@@ -966,6 +974,23 @@ def make_sfx_files():
         )
         if not os.path.exists(out_path) or os.path.getsize(out_path) < 1000:
             raise RuntimeError(f"{name} is empty")
+        peak = check_clipping(out_path)
+        if peak is not None:
+            delta = SFX_PEAK_DB - peak
+            if abs(delta) > 0.3:
+                tmp = out_path + ".lvl.mp3"
+                subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-loglevel", "error",
+                        "-i", out_path,
+                        "-af", f"volume={delta:.2f}dB",
+                        "-b:a", "96k", tmp,
+                    ],
+                    check=True,
+                )
+                os.replace(tmp, out_path)
+                peak = check_clipping(out_path)
+        log(f"sfx {name}: peak={peak:.1f} dB (target {SFX_PEAK_DB:.1f} dB)")
 
 
 # ---------------- music ----------------
