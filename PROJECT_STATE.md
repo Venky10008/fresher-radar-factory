@@ -1,6 +1,7 @@
 # PROJECT_STATE
 
 ## Latest fix
+- Music peak -18 configurable (MUSIC_PEAK_DB), v1 ducking, sfx whoosh/pop/ding in v1.
 - Fixed SyntaxError at line 422 in scripts/make_assets.py (orphan fragment removed).
 - Simplified normalize_te to one Latin-word-only version; Telugu text and ZWNJ untouched.
 - Removed unused Telugu grapheme helpers and the unused unicodedata import.

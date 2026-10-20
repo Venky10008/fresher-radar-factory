@@ -3,6 +3,7 @@ out
 public/audio/*.mp3
 public/images/*
 public/music.mp3
+public/sfx_*.mp3
 public/props.json
 job.json
 __pycache__/

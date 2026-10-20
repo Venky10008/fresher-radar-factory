@@ -14,7 +14,7 @@ Prepares everything Remotion needs for one reel:
         -1.5 dBTP).
   2. One picture per scene from the image prompts (Cloudflare FLUX, then Pollinations; a motion graphic is drawn if both fail)
   3. A soft background music pad (made with ffmpeg, no download needed)
-  4. A subtle transition whoosh (sfx, ffmpeg) — disable with job "sfx": false
+  4. Three sound effects (whoosh, pop, ding; ffmpeg) — disable with job "sfx": false
   5. public/props.json (scenes also carry optional audioSeconds + words)
 The video is always made, even if voice or pictures fail.
 """
@@ -934,25 +934,38 @@ def make_image(prompt, seed, out_path):
 
 
 # ---------------- sfx ----------------
-def make_sfx(out_path):
-    """A short, quiet noise whoosh for scene cuts — generated with ffmpeg."""
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-f", "lavfi", "-i", "anoisesrc=color=pink:duration=0.70:seed=3",
-            "-af",
-            (
-                "lowpass=f=2500,"
-                "afade=t=in:d=0.04,afade=t=out:st=0.60:d=0.10,"
-                "aformat=sample_rates=44100:channel_layouts=mono"
-            ),
-            "-c:a", "libmp3lame", "-b:a", "96k",
-            out_path,
-        ],
-        check=True,
-    )
-    if not os.path.exists(out_path) or os.path.getsize(out_path) < 1000:
-        raise RuntimeError("sfx file is empty")
+SFX_SPECS = {
+    "sfx_whoosh.mp3": (
+        "anoisesrc=color=pink:duration=0.6:seed=3",
+        "bandpass=f=1800:w=1.5,afade=t=in:d=0.12,afade=t=out:st=0.25:d=0.35,volume=2.5",
+    ),
+    "sfx_pop.mp3": (
+        "sine=f=880:d=0.18",
+        "afade=t=out:st=0.02:d=0.16,volume=0.8",
+    ),
+    "sfx_ding.mp3": (
+        "sine=f=1318:d=0.7",
+        "afade=t=out:st=0.05:d=0.65,volume=0.7",
+    ),
+}
+
+
+def make_sfx_files():
+    """Generate the three SFX (whoosh, pop, ding) with ffmpeg."""
+    for name, (source, af) in SFX_SPECS.items():
+        out_path = os.path.join("public", name)
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i", source,
+                "-af", af,
+                "-c:a", "libmp3lame", "-b:a", "96k",
+                out_path,
+            ],
+            check=True,
+        )
+        if not os.path.exists(out_path) or os.path.getsize(out_path) < 1000:
+            raise RuntimeError(f"{name} is empty")
 
 
 # ---------------- music ----------------
@@ -960,10 +973,11 @@ def make_music(seconds, root, out_path):
     """A soft, slow pad: open chord, gentle tremolo, low-pass and echo.
 
     FIX 4: music is ON by default; fade in 0.5 s and fade out 1 s; the file is
-    measured with volumedetect and scaled so its peak sits at -28 dB — the
-    templates play music at a fixed volume, so this is the "simple volume"
-    duck that keeps music ~28 dB under the voice while the gaps between
-    phrases are no longer digital silence. Minimum 5 s so the fades work.
+    measured with volumedetect and scaled so its peak sits at MUSIC_PEAK_DB
+    (default -18 dB) — the templates play music at a fixed volume, so this is
+    the "simple volume" duck that keeps music under the voice while the gaps
+    between phrases are no longer digital silence. Minimum 5 s so the fades
+    work.
     """
     safe_seconds = max(seconds, 5.0)
     ratios = [1.0, 1.5, 2.0, 2.25, 3.0]
@@ -988,7 +1002,12 @@ def make_music(seconds, root, out_path):
     peak = check_clipping(out_path)
     if peak is None:
         raise RuntimeError("could not measure the generated music (volumedetect failed)")
-    delta = -28.0 - peak
+    try:
+        target_peak = float(os.environ.get("MUSIC_PEAK_DB", "-18").strip())
+    except ValueError:
+        log("WARNING: MUSIC_PEAK_DB is not a number, using -18")
+        target_peak = -18.0
+    delta = target_peak - peak
     if abs(delta) > 0.3:
         tmp = out_path + ".lvl.mp3"
         subprocess.run(
@@ -1004,7 +1023,33 @@ def make_music(seconds, root, out_path):
         peak = check_clipping(out_path)
     log(
         f"music pad {safe_seconds:.1f}s, fade-in 0.5s, fade-out 1s, "
-        f"max_volume={peak:.1f} dB (target -28 dB under the voice)"
+        f"peak={peak:.1f} dB (MUSIC_PEAK_DB={target_peak:.1f})"
+    )
+
+
+def log_sfx_placements(scenes):
+    """Print where template v1 puts the whoosh/pop/ding (global frames)."""
+    starts = []
+    acc = 0
+    for s in scenes:
+        starts.append(acc)
+        acc += s["frames"]
+    log("== SFX placements (v1 timeline, 30 fps) ==")
+    counts = {"whoosh": 0, "pop": 0, "ding": 0}
+    for i, s in enumerate(scenes):
+        events = []
+        if i > 0:
+            events.append(f"whoosh@{starts[i]}")
+            counts["whoosh"] += 1
+        events.append(f"pop@{starts[i]}")
+        counts["pop"] += 1
+        if s.get("kind") == "cta":
+            events.append(f"ding@{starts[i]}")
+            counts["ding"] += 1
+        log(f"  scene {i} ({s['kind']}) frames={s['frames']}: " + ", ".join(events))
+    log(
+        f"  totals: whoosh={counts['whoosh']}, pop={counts['pop']}, "
+        f"ding={counts['ding']}, all={sum(counts.values())}"
     )
 
 
@@ -1373,18 +1418,30 @@ def main():
         except Exception as exc:  # noqa: BLE001
             log(f"WARNING: music failed ({exc}). Continuing without music.")
 
-    # ----- transition sound -----
-    sfx_rel = None
-    sfx_path = "public/sfx_whoosh.mp3"
-    if os.path.exists(sfx_path):
-        os.remove(sfx_path)
+    # ----- sound effects -----
+    sfx_rels = {"whoosh": None, "pop": None, "ding": None}
+    for name in SFX_SPECS:
+        path = os.path.join("public", name)
+        if os.path.exists(path):
+            os.remove(path)
     if want_sfx:
         try:
-            make_sfx(sfx_path)
-            sfx_rel = "sfx_whoosh.mp3"
-            log("== SFX == subtle transition whoosh created")
+            make_sfx_files()
+            sfx_rels = {
+                "whoosh": "sfx_whoosh.mp3",
+                "pop": "sfx_pop.mp3",
+                "ding": "sfx_ding.mp3",
+            }
+            log("== SFX == whoosh, pop and ding created")
+            log_sfx_placements(scenes)
         except Exception as exc:  # noqa: BLE001
-            log(f"WARNING: transition sound failed ({exc}). Continuing without it.")
+            log(f"WARNING: sound effects failed ({exc}). Continuing without them.")
+            for name in SFX_SPECS:
+                path = os.path.join("public", name)
+                if os.path.exists(path):
+                    os.remove(path)
+    else:
+        log('sfx=off: job JSON sets "sfx": false - no whoosh/pop/ding')
 
     props = {
         "brand": job.get("brand") or "Fresher Radar",
@@ -1397,7 +1454,9 @@ def main():
         "seed": seed,
         "fontMode": FONT_MODE,
         "music": music_rel,
-        "sfx": sfx_rel,
+        "sfx": sfx_rels["whoosh"],
+        "sfxPop": sfx_rels["pop"],
+        "sfxDing": sfx_rels["ding"],
         "scenes": scenes,
     }
     with open("public/props.json", "w", encoding="utf-8") as f:

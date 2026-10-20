@@ -22,7 +22,7 @@ import { CtaScene } from "./scenes/CtaScene";
  *  - a brand header that never moves
  *  - scene layers that crossfade with a 12-frame overlap (MOTION.exit)
  *  - a segmented progress bar just above the bottom safe edge
- *  - music that ducks under every spoken line; optional whoosh on cuts
+ *  - music that ducks under every spoken line; optional whoosh/pop/ding sfx
  */
 export const RadarReelV2: React.FC<ReelProps> = (props) => {
   const fontFamily = useFonts(props.fontMode);
@@ -103,7 +103,15 @@ export const RadarReelV2: React.FC<ReelProps> = (props) => {
               <Audio src={staticFile(s.audio)} volume={1} />
             ) : null}
             {i > 0 && props.sfx ? (
-              <Audio src={staticFile(props.sfx)} volume={0.16} />
+              <Audio src={staticFile(props.sfx)} volume={0.5} />
+            ) : null}
+            {props.sfxPop ? (
+              <Audio src={staticFile(props.sfxPop)} volume={0.3} />
+            ) : null}
+            {s.kind === "cta" && props.sfxDing ? (
+              <Sequence from={10} layout="none">
+                <Audio src={staticFile(props.sfxDing)} volume={0.3} />
+              </Sequence>
             ) : null}
             <SceneShell sceneFrames={frames[i]}>
               {s.kind === "hook" ? (

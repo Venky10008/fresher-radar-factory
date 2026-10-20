@@ -49,5 +49,9 @@ export type ReelProps = {
   scenes: Scene[];
   /** OPTIONAL: subtle transition sound (a short whoosh) inside /public, or null */
   sfx?: string | null;
+  /** OPTIONAL: pop when the text card appears, inside /public, or null */
+  sfxPop?: string | null;
+  /** OPTIONAL: ding when the CTA buttons appear, inside /public, or null */
+  sfxDing?: string | null;
 };
 
