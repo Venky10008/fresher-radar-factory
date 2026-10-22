@@ -61,7 +61,7 @@ CATEGORY = {
             "a student studying at a desk with a laptop and notebooks, warm light",
             "abstract connected nodes and sparkles representing artificial intelligence",
         ],
-        "cta": "రోజూ ఇలాంటి AI tools updates కోసం, bio లో ఉన్న Fresher Radar group లో join అవ్వండి.",
+        "cta": "ఆ టూల్ కావాలంటే బయోలో ఉన్న లింక్ నుంచి మన గ్రూప్‌లో జాయిన్ అవ్వండి. ప్రతిరోజూ కొత్త టూల్స్ అప్‌డేట్స్ పోస్ట్ చేస్తాం.",
         "root": 110.0,
     },
     "private_jobs": {
@@ -76,7 +76,7 @@ CATEGORY = {
             "young graduates in smart casual clothes smiling in a bright office",
             "a resume, laptop and coffee on a clean desk",
         ],
-        "cta": "రోజూ ఇలాంటి jobs updates కోసం, bio లో ఉన్న Fresher Radar group లో join అవ్వండి.",
+        "cta": "ఈ జాబ్ వివరాలు కావాలంటే బయోలో ఉన్న లింక్ నుంచి మన గ్రూప్‌లో జాయిన్ అవ్వండి. ప్రతిరోజూ కొత్త జాబ్ అప్‌డేట్స్ పోస్ట్ చేస్తాం.",
         "root": 130.81,
     },
     "govt_jobs": {
@@ -91,7 +91,7 @@ CATEGORY = {
             "students preparing for an exam with books in a library",
             "an official application form and pen on a wooden desk",
         ],
-        "cta": "ఇలాంటి govt jobs notifications కోసం, bio లో ఉన్న Fresher Radar group లో join అవ్వండి.",
+        "cta": "ఈ నోటిఫికేషన్ వివరాలు కావాలంటే బయోలో ఉన్న లింక్ నుంచి మన గ్రూప్‌లో జాయిన్ అవ్వండి. ప్రతిరోజూ కొత్త నోటిఫికేషన్స్ పోస్ట్ చేస్తాం.",
         "root": 146.83,
     },
     "internships": {
@@ -106,7 +106,7 @@ CATEGORY = {
             "a student holding a laptop and a certificate, happy",
             "a notebook with a career roadmap and sticky notes",
         ],
-        "cta": "ఇలాంటి internships కోసం, bio లో ఉన్న Fresher Radar group లో join అవ్వండి.",
+        "cta": "ఈ ఇంటర్న్‌షిప్ వివరాలు కావాలంటే బయోలో ఉన్న లింక్ నుంచి మన గ్రూప్‌లో జాయిన్ అవ్వండి. ప్రతిరోజూ కొత్త ఇంటర్న్‌షిప్ అప్‌డేట్స్ పోస్ట్ చేస్తాం.",
         "root": 164.81,
     },
     "certificates": {
@@ -121,7 +121,7 @@ CATEGORY = {
             "a student learning online on a laptop with headphones",
             "a graduation cap and books on a desk",
         ],
-        "cta": "ఇలాంటి free courses కోసం, bio లో ఉన్న Fresher Radar group లో join అవ్వండి.",
+        "cta": "ఈ కోర్స్ వివరాలు కావాలంటే బయోలో ఉన్న లింక్ నుంచి మన గ్రూప్‌లో జాయిన్ అవ్వండి. ప్రతిరోజూ కొత్త కోర్స్ అప్‌డేట్స్ పోస్ట్ చేస్తాం.",
         "root": 87.31,
     },
     "career_boost": {
@@ -136,7 +136,7 @@ CATEGORY = {
             "two people in a friendly interview conversation",
             "a staircase made of books leading up toward a bright light",
         ],
-        "cta": "ఇలాంటి career tips కోసం, bio లో ఉన్న Fresher Radar group లో join అవ్వండి.",
+        "cta": "ఈ కెరీర్ టిప్ వివరాలు కావాలంటే బయోలో ఉన్న లింక్ నుంచి మన గ్రూప్‌లో జాయిన్ అవ్వండి. ప్రతిరోజూ కొత్త కెరీర్ టిప్స్ పోస్ట్ చేస్తాం.",
         "root": 98.0,
     },
 }
@@ -789,25 +789,15 @@ def _sanitize_prompt(prompt):
     return _TELUGU_RE.sub("[Telugu script]", str(prompt or ""))
 
 
-# FIX 2: words that push FLUX into drawing fake text/screens. Every prompt
-# containing one gets that phrase replaced with a neutral object, and the
-# strict no-text suffix below is appended to EVERY picture prompt.
-BANNED_PHRASES = [
-    "whiteboard", "dashboard", "checklist", "interface",
-    "screen", "monitor", "display", "diagram", "chart",
-    "poster", "document", "sign", "book", "quiz", "laptop", "code", "ui",
-]
-_NEUTRAL_OBJECTS = [
-    "glowing abstract shapes",
-    "floating geometric icons",
-    "futuristic desk lamp",
-    "soft glowing orbs",
-    "abstract flowing ribbons",
-]
+# Image models write gibberish when a prompt asks for readable UI. We do NOT
+# replace useful visual nouns (laptop, screen, document, book, code) because
+# that made the pictures irrelevant to the narration. Keep the scene, allow
+# blank screens, and forbid readable text instead.
+BANNED_PHRASES = []
+_NEUTRAL_OBJECTS = []
 NO_TEXT_SUFFIX = (
-    ", no text, no letters, no words, no numbers, no captions, no signs, "
-    "no logos, no watermark, no user interface, no screens with writing, "
-    "no code on screen"
+    ", no readable text, no letters, no words, no numbers, no captions, "
+    "no signs, no logos, no watermark, no readable code, no brand names"
 )
 # FIX 3: camera angles used to derive fresh prompts when the job has fewer
 # prompts than picture scenes.
@@ -818,7 +808,7 @@ _CAMERA_ANGLES = [
 
 
 def _strip_banned_words(prompt):
-    """Replace screen/code/diagram/... phrases with neutral objects (FIX 2)."""
+    """Compatibility shim. No scene nouns are replaced any more."""
     out = str(prompt or "")
     for i, word in enumerate(sorted(BANNED_PHRASES, key=len, reverse=True)):
         pattern = rf"\b{re.escape(word)}s?\b"
@@ -833,7 +823,7 @@ def _strip_banned_words(prompt):
 
 
 def build_picture_prompt(base_prompt, style):
-    """FIX 2: sanitize -> replace banned words -> append no-text suffix."""
+    """Keep the scene description, then append the strict no-text suffix."""
     cleaned = _strip_banned_words(_sanitize_prompt(base_prompt))
     return f"{cleaned}, {style}{NO_TEXT_SUFFIX}"
 
@@ -1314,8 +1304,8 @@ def main():
         log("no image_prompts in the job, using generic prompts for this category")
     n = len(plan) - sum(1 for k, _, _ in plan if k == "cta")
     style = (
-        f"{cat['style']} color palette, modern clean illustration, soft lighting, "
-        "no real people's faces"
+        f"{cat['style']} color palette, modern clean illustration, cinematic lighting, "
+        "clear focal subject, accurate proportions, no real people's faces"
     )
     # FIX 3: never reuse a prompt across scenes. With fewer base prompts
     # than picture scenes, derive extras by changing the camera angle.

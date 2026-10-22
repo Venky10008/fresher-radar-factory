@@ -199,11 +199,7 @@ export const SceneView: React.FC<{
             <Chip label={props.badge} size={34} bg="#FFFFFF" color="#101828" icon={icon} iconColor={theme.accent} />
           </div>
           <div style={{ position: "absolute", left: SIDE + 30, right: SIDE + 30, top: chipsTop, display: "flex", justifyContent: "space-between" }}>
-            {props.toolName ? (
-              <Chip label={props.toolName} size={36} bg={withAlpha("#000000", 0.55)} color="#FFFFFF" />
-            ) : (
-              <span />
-            )}
+            <span />
             {props.pricing && props.pricing !== "unknown" ? (
               <Chip
                 label={props.pricing === "free" ? "Free" : props.pricing}
